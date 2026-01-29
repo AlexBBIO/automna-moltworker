@@ -25,7 +25,7 @@ import { getSandbox, Sandbox, type SandboxOptions } from '@cloudflare/sandbox';
 
 import type { AppEnv, MoltbotEnv } from './types';
 import { MOLTBOT_PORT } from './config';
-import { createAccessMiddleware } from './auth';
+import { createAccessMiddleware, validateSignedUrl } from './auth';
 import { ensureMoltbotGateway, findExistingMoltbotProcess, syncToR2 } from './gateway';
 import { publicRoutes, api, adminUi, debug, cdp } from './routes';
 import loadingPageHtml from './assets/loading.html';
@@ -122,9 +122,38 @@ app.use('*', async (c, next) => {
 });
 
 // Middleware: Initialize sandbox for all requests
+// For signed URLs (user sessions), routes to per-user sandbox
+// For admin/public routes, uses 'shared' sandbox
 app.use('*', async (c, next) => {
   const options = buildSandboxOptions(c.env);
-  const sandbox = getSandbox(c.env.Sandbox, 'moltbot', options);
+  const url = new URL(c.req.url);
+  
+  // Check for signed URL params (multi-user isolation)
+  const userId = url.searchParams.get('userId');
+  const hasSignedParams = userId && url.searchParams.get('exp') && url.searchParams.get('sig');
+  
+  if (hasSignedParams && c.env.MOLTBOT_SIGNING_SECRET) {
+    // Validate signed URL
+    const validation = await validateSignedUrl(url, c.env.MOLTBOT_SIGNING_SECRET);
+    
+    if (validation.valid && validation.userId) {
+      // Create per-user sandbox
+      // Normalize to lowercase to avoid Cloudflare hostname issues
+      const sandboxId = `user-${validation.userId}`.toLowerCase();
+      console.log(`[SANDBOX] Creating per-user sandbox: ${sandboxId}`);
+      const sandbox = getSandbox(c.env.Sandbox, sandboxId, { ...options, normalizeId: true });
+      c.set('sandbox', sandbox);
+      c.set('userId', validation.userId);
+      return next();
+    } else {
+      // Invalid signature - reject with 401
+      console.error(`[SANDBOX] Invalid signed URL: ${validation.error}`);
+      return c.json({ error: 'Unauthorized', details: validation.error }, 401);
+    }
+  }
+  
+  // No signed URL params - use admin sandbox (for CF Access authenticated routes)
+  const sandbox = getSandbox(c.env.Sandbox, 'shared', options);
   c.set('sandbox', sandbox);
   await next();
 });
@@ -144,7 +173,7 @@ app.route('/cdp', cdp);
 // PROTECTED ROUTES: Cloudflare Access authentication required
 // =============================================================================
 
-// Middleware: Validate required environment variables (skip in dev mode and for debug routes)
+// Middleware: Validate required environment variables (skip in dev mode, debug routes, and signed URL auth)
 app.use('*', async (c, next) => {
   const url = new URL(c.req.url);
   
@@ -155,6 +184,12 @@ app.use('*', async (c, next) => {
   
   // Skip validation in dev mode
   if (c.env.DEV_MODE === 'true') {
+    return next();
+  }
+  
+  // Skip validation for signed URL authenticated requests (userId was set by sandbox middleware)
+  // These requests use signed URL auth instead of CF Access, so they don't need CF_ACCESS_* vars
+  if (c.get('userId')) {
     return next();
   }
   
@@ -182,7 +217,14 @@ app.use('*', async (c, next) => {
 });
 
 // Middleware: Cloudflare Access authentication for protected routes
+// Skip if already authenticated via signed URL (userId is set)
 app.use('*', async (c, next) => {
+  // If user is already authenticated via signed URL, skip CF Access
+  if (c.get('userId')) {
+    console.log('[AUTH] Skipping CF Access - user authenticated via signed URL');
+    return next();
+  }
+  
   // Determine response type based on Accept header
   const acceptsHtml = c.req.header('Accept')?.includes('text/html');
   const middleware = createAccessMiddleware({ 
@@ -292,11 +334,34 @@ app.all('*', async (c) => {
     console.log('[WS] containerWs.readyState:', containerWs.readyState);
     console.log('[WS] serverWs.readyState:', serverWs.readyState);
     
-    // Relay messages from client to container
+    // Get gateway token for auth injection
+    const gatewayToken = c.env.MOLTBOT_GATEWAY_TOKEN;
+    
+    // Relay messages from client to container, injecting auth token on connect
     serverWs.addEventListener('message', (event) => {
       console.log('[WS] Client -> Container:', typeof event.data, typeof event.data === 'string' ? event.data.slice(0, 200) : '(binary)');
+      
+      let dataToSend = event.data;
+      
+      // Intercept connect message and inject gateway token
+      if (typeof event.data === 'string' && gatewayToken) {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.method === 'connect') {
+            console.log('[WS] Intercepting connect message to inject auth token');
+            msg.params = msg.params || {};
+            msg.params.auth = msg.params.auth || {};
+            msg.params.auth.token = gatewayToken;
+            dataToSend = JSON.stringify(msg);
+            console.log('[WS] Injected gateway token into connect message');
+          }
+        } catch (e) {
+          // Not JSON, send as-is
+        }
+      }
+      
       if (containerWs.readyState === WebSocket.OPEN) {
-        containerWs.send(event.data);
+        containerWs.send(dataToSend);
       } else {
         console.log('[WS] Container not open, readyState:', containerWs.readyState);
       }
@@ -383,7 +448,10 @@ app.all('*', async (c) => {
 
 /**
  * Scheduled handler for cron triggers.
- * Syncs moltbot config/state from container to R2 for persistence.
+ * Syncs admin sandbox config/state from container to R2 for persistence.
+ * 
+ * Note: User-specific sandbox syncs happen within user sessions, not via cron.
+ * This cron job only handles the admin sandbox (for CF Access authenticated routes).
  */
 async function scheduled(
   _event: ScheduledEvent,
@@ -391,15 +459,15 @@ async function scheduled(
   _ctx: ExecutionContext
 ): Promise<void> {
   const options = buildSandboxOptions(env);
-  const sandbox = getSandbox(env.Sandbox, 'moltbot', options);
+  const sandbox = getSandbox(env.Sandbox, 'shared', options);
 
-  console.log('[cron] Starting backup sync to R2...');
+  console.log('[cron] Starting admin sandbox backup sync to R2...');
   const result = await syncToR2(sandbox, env);
   
   if (result.success) {
-    console.log('[cron] Backup sync completed successfully at', result.lastSync);
+    console.log('[cron] Admin backup sync completed successfully at', result.lastSync);
   } else {
-    console.error('[cron] Backup sync failed:', result.error, result.details || '');
+    console.error('[cron] Admin backup sync failed:', result.error, result.details || '');
   }
 }
 
@@ -407,3 +475,4 @@ export default {
   fetch: app.fetch,
   scheduled,
 };
+// Deploy 1769723534

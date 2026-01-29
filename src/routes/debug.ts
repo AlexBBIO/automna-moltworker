@@ -353,6 +353,83 @@ debug.get('/env', async (c) => {
   });
 });
 
+// GET /debug/sessions-files - List session files to debug history
+debug.get('/sessions-files', async (c) => {
+  const sandbox = c.get('sandbox');
+  
+  try {
+    const proc = await sandbox.startProcess('find /root/.clawdbot/agents -type f -name "*.json" 2>/dev/null | head -50 && echo "---" && ls -la /root/.clawdbot/agents/main/sessions/ 2>/dev/null');
+    
+    let attempts = 0;
+    while (attempts < 20) {
+      await new Promise(r => setTimeout(r, 200));
+      if (proc.status !== 'running') break;
+      attempts++;
+    }
+
+    const logs = await proc.getLogs();
+    return c.json({
+      stdout: logs.stdout || '',
+      stderr: logs.stderr || '',
+    });
+  } catch (err) {
+    return c.json({ error: String(err) }, 500);
+  }
+});
+
+// GET /debug/session-data - Read sessions.json content
+debug.get('/session-data', async (c) => {
+  const sandbox = c.get('sandbox');
+  
+  try {
+    const proc = await sandbox.startProcess('cat /root/.clawdbot/agents/main/sessions/sessions.json 2>/dev/null');
+    
+    let attempts = 0;
+    while (attempts < 20) {
+      await new Promise(r => setTimeout(r, 200));
+      if (proc.status !== 'running') break;
+      attempts++;
+    }
+
+    const logs = await proc.getLogs();
+    let data = null;
+    try {
+      data = JSON.parse(logs.stdout || '');
+    } catch {}
+    return c.json({ data, raw: logs.stdout?.slice(0, 2000) });
+  } catch (err) {
+    return c.json({ error: String(err) }, 500);
+  }
+});
+
+// GET /debug/session-history - Read the JSONL history file
+debug.get('/session-history', async (c) => {
+  const sandbox = c.get('sandbox');
+  
+  try {
+    // Simple approach - just cat and wc
+    const proc = await sandbox.startProcess(
+      'cat /root/.clawdbot/agents/main/sessions/sessions.json | head -c 500 && echo "---JSONL---" && ' +
+      'JSONL=$(cat /root/.clawdbot/agents/main/sessions/sessions.json | grep -o "sessionFile[^,]*" | head -1 | cut -d\\" -f3) && ' +
+      'echo "File: $JSONL" && ' +
+      'wc -l "$JSONL" 2>&1 && ' +
+      'cat "$JSONL" | grep -c "message" 2>&1'
+    );
+    
+    let attempts = 0;
+    while (attempts < 30) {
+      await new Promise(r => setTimeout(r, 200));
+      if (proc.status !== 'running') break;
+      attempts++;
+    }
+
+    const logs = await proc.getLogs();
+    return c.json({ stdout: logs.stdout, stderr: logs.stderr });
+  } catch (err) {
+    return c.json({ error: String(err) }, 500);
+  }
+});
+
 // GET /debug/container-config - Read the moltbot config from inside the container
 debug.get('/container-config', async (c) => {
   const sandbox = c.get('sandbox');

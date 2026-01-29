@@ -37,6 +37,8 @@ export interface MoltbotEnv {
   BROWSER?: Fetcher;
   CDP_SECRET?: string; // Shared secret for CDP endpoint authentication
   WORKER_URL?: string; // Public URL of the worker (for CDP endpoint)
+  // Multi-user isolation
+  MOLTBOT_SIGNING_SECRET?: string; // HMAC secret for signed URL validation
 }
 
 /**
@@ -55,6 +57,7 @@ export type AppEnv = {
   Variables: {
     sandbox: Sandbox;
     accessUser?: AccessUser;
+    userId?: string; // Authenticated user ID from signed URL
   };
 };
 

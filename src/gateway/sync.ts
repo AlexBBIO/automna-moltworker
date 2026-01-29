@@ -1,6 +1,6 @@
 import type { Sandbox } from '@cloudflare/sandbox';
 import type { MoltbotEnv } from '../types';
-import { R2_MOUNT_PATH } from '../config';
+import { R2_MOUNT_PATH, getUserR2Path } from '../config';
 import { mountR2Storage } from './r2';
 import { waitForProcess } from './utils';
 
@@ -9,6 +9,11 @@ export interface SyncResult {
   lastSync?: string;
   error?: string;
   details?: string;
+}
+
+export interface SyncOptions {
+  /** User ID for multi-user isolation (optional) */
+  userId?: string;
 }
 
 /**
@@ -20,11 +25,18 @@ export interface SyncResult {
  * 3. Runs rsync to copy config to R2
  * 4. Writes a timestamp file for tracking
  * 
+ * For multi-user isolation, pass options.userId to sync to /users/{userId}/ path.
+ * 
  * @param sandbox - The sandbox instance
  * @param env - Worker environment bindings
+ * @param options - Sync options including userId for multi-user isolation
  * @returns SyncResult with success status and optional error details
  */
-export async function syncToR2(sandbox: Sandbox, env: MoltbotEnv): Promise<SyncResult> {
+export async function syncToR2(
+  sandbox: Sandbox,
+  env: MoltbotEnv,
+  options: SyncOptions = {}
+): Promise<SyncResult> {
   // Check if R2 is configured
   if (!env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY || !env.CF_ACCOUNT_ID) {
     return { success: false, error: 'R2 storage is not configured' };
@@ -35,6 +47,10 @@ export async function syncToR2(sandbox: Sandbox, env: MoltbotEnv): Promise<SyncR
   if (!mounted) {
     return { success: false, error: 'Failed to mount R2 storage' };
   }
+
+  // Get user-specific R2 path (or root for admin)
+  const userR2Path = getUserR2Path(options.userId);
+  console.log(`[SYNC] Syncing to R2 path: ${userR2Path}`);
 
   // Sanity check: verify source has critical files before syncing
   // This prevents accidentally overwriting a good backup with empty/corrupted data
@@ -57,9 +73,18 @@ export async function syncToR2(sandbox: Sandbox, env: MoltbotEnv): Promise<SyncR
     };
   }
 
+  // Ensure the user directory exists
+  const mkdirCmd = `mkdir -p ${userR2Path}`;
+  try {
+    const mkdirProc = await sandbox.startProcess(mkdirCmd);
+    await waitForProcess(mkdirProc, 5000);
+  } catch (err) {
+    console.error('[SYNC] Failed to create user directory:', err);
+  }
+
   // Run rsync to backup config to R2
   // Note: Use --no-times because s3fs doesn't support setting timestamps
-  const syncCmd = `rsync -r --no-times --delete --exclude='*.lock' --exclude='*.log' --exclude='*.tmp' /root/.clawdbot/ ${R2_MOUNT_PATH}/clawdbot/ && rsync -r --no-times --delete /root/clawd/skills/ ${R2_MOUNT_PATH}/skills/ && date -Iseconds > ${R2_MOUNT_PATH}/.last-sync`;
+  const syncCmd = `rsync -r --no-times --delete --exclude='*.lock' --exclude='*.log' --exclude='*.tmp' /root/.clawdbot/ ${userR2Path}/clawdbot/ && rsync -r --no-times --delete /root/clawd/skills/ ${userR2Path}/skills/ && date -Iseconds > ${userR2Path}/.last-sync`;
   
   try {
     const proc = await sandbox.startProcess(syncCmd);
@@ -67,8 +92,7 @@ export async function syncToR2(sandbox: Sandbox, env: MoltbotEnv): Promise<SyncR
 
     // Check for success by reading the timestamp file
     // (process status may not update reliably in sandbox API)
-    // Note: backup structure is ${R2_MOUNT_PATH}/clawdbot/ and ${R2_MOUNT_PATH}/skills/
-    const timestampProc = await sandbox.startProcess(`cat ${R2_MOUNT_PATH}/.last-sync`);
+    const timestampProc = await sandbox.startProcess(`cat ${userR2Path}/.last-sync`);
     await waitForProcess(timestampProc, 5000);
     const timestampLogs = await timestampProc.getLogs();
     const lastSync = timestampLogs.stdout?.trim();

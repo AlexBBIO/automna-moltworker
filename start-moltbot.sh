@@ -176,11 +176,10 @@ if (process.env.CLAWDBOT_GATEWAY_TOKEN) {
     config.gateway.auth.token = process.env.CLAWDBOT_GATEWAY_TOKEN;
 }
 
-// Allow insecure auth for dev mode
-if (process.env.CLAWDBOT_DEV_MODE === 'true') {
-    config.gateway.controlUi = config.gateway.controlUi || {};
-    config.gateway.controlUi.allowInsecureAuth = true;
-}
+// Allow insecure auth - ALWAYS enabled for Automna MVP
+// This allows webchat connections without device pairing
+config.gateway.controlUi = config.gateway.controlUi || {};
+config.gateway.controlUi.allowInsecureAuth = true;
 
 // Telegram configuration
 if (process.env.TELEGRAM_BOT_TOKEN) {
@@ -292,3 +291,4 @@ else
     echo "Starting gateway with device pairing (no token)..."
     exec clawdbot gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE"
 fi
+# Rebuild marker: 1769727830

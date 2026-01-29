@@ -281,4 +281,81 @@ adminApi.post('/gateway/restart', async (c) => {
 // Mount admin API routes under /admin
 api.route('/admin', adminApi);
 
+/**
+ * OPTIONS /api/history - CORS preflight
+ */
+api.options('/history', (c) => {
+  c.header('Access-Control-Allow-Origin', '*');
+  c.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  c.header('Access-Control-Allow-Headers', 'Content-Type');
+  return c.text('', 204);
+});
+
+/**
+ * GET /api/history - Get chat history directly from JSONL file
+ * Workaround for chat.history returning empty
+ */
+api.get('/history', async (c) => {
+  // Add CORS headers for cross-origin requests from automna.ai
+  c.header('Access-Control-Allow-Origin', '*');
+  c.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  c.header('Access-Control-Allow-Headers', 'Content-Type');
+  
+  const sandbox = c.get('sandbox');
+  const sessionKey = c.req.query('sessionKey') || 'main';
+  
+  try {
+    // Ensure gateway is running
+    await ensureMoltbotGateway(sandbox, c.env);
+    
+    // Read sessions.json and find the JSONL file for this session
+    const script = `
+      const fs = require('fs');
+      const storePath = '/root/.clawdbot/agents/main/sessions/sessions.json';
+      if (!fs.existsSync(storePath)) {
+        console.log(JSON.stringify({ error: 'sessions.json not found' }));
+        process.exit(0);
+      }
+      const store = JSON.parse(fs.readFileSync(storePath, 'utf-8'));
+      const entry = store['${sessionKey}'];
+      if (!entry) {
+        console.log(JSON.stringify({ error: 'session not found', keys: Object.keys(store) }));
+        process.exit(0);
+      }
+      const sessionFile = entry.sessionFile;
+      if (!fs.existsSync(sessionFile)) {
+        console.log(JSON.stringify({ error: 'JSONL file not found', sessionFile }));
+        process.exit(0);
+      }
+      const lines = fs.readFileSync(sessionFile, 'utf-8').split(/\\r?\\n/);
+      const messages = [];
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed.message && (parsed.message.role === 'user' || parsed.message.role === 'assistant')) {
+            messages.push(parsed.message);
+          }
+        } catch {}
+      }
+      console.log(JSON.stringify({ sessionKey: '${sessionKey}', messages }));
+    `;
+    
+    const proc = await sandbox.startProcess(
+      'node -e ' + JSON.stringify(script.replace(/\n/g, ' '))
+    );
+    await waitForProcess(proc, 10000);
+    
+    const logs = await proc.getLogs();
+    try {
+      return c.json(JSON.parse(logs.stdout || '{}'));
+    } catch {
+      return c.json({ error: 'Failed to parse output', stdout: logs.stdout, stderr: logs.stderr }, 500);
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
 export { api };
