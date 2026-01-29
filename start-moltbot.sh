@@ -20,10 +20,23 @@ CONFIG_DIR="/root/.clawdbot"
 CONFIG_FILE="$CONFIG_DIR/clawdbot.json"
 TEMPLATE_DIR="/root/.clawdbot-templates"
 TEMPLATE_FILE="$TEMPLATE_DIR/moltbot.json.template"
-BACKUP_DIR="/data/moltbot"
+
+# User-specific R2 path if MOLTBOT_USER_ID is set
+if [ -n "$MOLTBOT_USER_ID" ]; then
+    BACKUP_DIR="/data/moltbot/users/$MOLTBOT_USER_ID"
+    echo "Per-user mode: userId=$MOLTBOT_USER_ID"
+else
+    BACKUP_DIR="/data/moltbot"
+    echo "Shared mode: no userId (admin/cron)"
+fi
 
 echo "Config directory: $CONFIG_DIR"
 echo "Backup directory: $BACKUP_DIR"
+
+# Create user-specific backup directory if needed
+if [ -n "$MOLTBOT_USER_ID" ] && [ -d "/data/moltbot" ]; then
+    mkdir -p "$BACKUP_DIR"
+fi
 
 # Create config directory
 mkdir -p "$CONFIG_DIR"
@@ -338,3 +351,4 @@ else
 fi
 # Rebuild marker: 1769727830
 # Rebuild: 1769729813
+# Rebuild: 1769730234

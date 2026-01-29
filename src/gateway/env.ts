@@ -4,10 +4,16 @@ import type { MoltbotEnv } from '../types';
  * Build environment variables to pass to the Moltbot container process
  * 
  * @param env - Worker environment bindings
+ * @param userId - Optional user ID for per-user isolation
  * @returns Environment variables record
  */
-export function buildEnvVars(env: MoltbotEnv): Record<string, string> {
+export function buildEnvVars(env: MoltbotEnv, userId?: string): Record<string, string> {
   const envVars: Record<string, string> = {};
+  
+  // Pass userId for per-user R2 paths
+  if (userId) {
+    envVars.MOLTBOT_USER_ID = userId;
+  }
 
   const isOpenAIGateway = env.AI_GATEWAY_BASE_URL?.endsWith('/openai');
 
