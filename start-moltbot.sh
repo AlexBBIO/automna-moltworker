@@ -72,18 +72,33 @@ should_restore_from_r2() {
     fi
 }
 
-if [ -f "$BACKUP_DIR/clawdbot/clawdbot.json" ]; then
+# Try new structure first (config/ and workspace/)
+if [ -f "$BACKUP_DIR/config/clawdbot.json" ]; then
     if should_restore_from_r2; then
-        echo "Restoring from R2 backup at $BACKUP_DIR/clawdbot..."
+        echo "Restoring config from R2 at $BACKUP_DIR/config/..."
+        cp -a "$BACKUP_DIR/config/." "$CONFIG_DIR/"
+        echo "Restored config from R2"
+    fi
+    if [ -d "$BACKUP_DIR/workspace" ] && [ "$(ls -A $BACKUP_DIR/workspace 2>/dev/null)" ]; then
+        if should_restore_from_r2; then
+            echo "Restoring workspace from R2 at $BACKUP_DIR/workspace/..."
+            mkdir -p /root/clawd
+            cp -a "$BACKUP_DIR/workspace/." /root/clawd/
+            echo "Restored workspace from R2"
+        fi
+    fi
+# Legacy: clawdbot/ subdirectory
+elif [ -f "$BACKUP_DIR/clawdbot/clawdbot.json" ]; then
+    if should_restore_from_r2; then
+        echo "Restoring from legacy R2 backup at $BACKUP_DIR/clawdbot..."
         cp -a "$BACKUP_DIR/clawdbot/." "$CONFIG_DIR/"
-        # Copy the sync timestamp to local so we know what version we have
         cp -f "$BACKUP_DIR/.last-sync" "$CONFIG_DIR/.last-sync" 2>/dev/null || true
         echo "Restored config from R2 backup"
     fi
+# Legacy: flat structure
 elif [ -f "$BACKUP_DIR/clawdbot.json" ]; then
-    # Legacy backup format (flat structure)
     if should_restore_from_r2; then
-        echo "Restoring from legacy R2 backup at $BACKUP_DIR..."
+        echo "Restoring from legacy flat R2 backup at $BACKUP_DIR..."
         cp -a "$BACKUP_DIR/." "$CONFIG_DIR/"
         cp -f "$BACKUP_DIR/.last-sync" "$CONFIG_DIR/.last-sync" 2>/dev/null || true
         echo "Restored config from legacy R2 backup"
@@ -95,10 +110,14 @@ else
 fi
 
 # Restore skills from R2 backup if available (only if R2 is newer)
+# Check both new location (inside workspace) and legacy location
 SKILLS_DIR="/root/clawd/skills"
-if [ -d "$BACKUP_DIR/skills" ] && [ "$(ls -A $BACKUP_DIR/skills 2>/dev/null)" ]; then
+if [ -d "$BACKUP_DIR/workspace/skills" ] && [ "$(ls -A $BACKUP_DIR/workspace/skills 2>/dev/null)" ]; then
+    # Skills already restored with workspace
+    echo "Skills restored with workspace"
+elif [ -d "$BACKUP_DIR/skills" ] && [ "$(ls -A $BACKUP_DIR/skills 2>/dev/null)" ]; then
     if should_restore_from_r2; then
-        echo "Restoring skills from $BACKUP_DIR/skills..."
+        echo "Restoring skills from legacy $BACKUP_DIR/skills..."
         mkdir -p "$SKILLS_DIR"
         cp -a "$BACKUP_DIR/skills/." "$SKILLS_DIR/"
         echo "Restored skills from R2 backup"
@@ -271,9 +290,35 @@ console.log('Config:', JSON.stringify(config, null, 2));
 EOFNODE
 
 # ============================================================
+# START BACKGROUND SYNC
+# ============================================================
+# Sync workspace and config to R2 every 30 seconds
+# This ensures data persists across container restarts
+if [ -d "$BACKUP_DIR" ]; then
+    echo "Starting background sync to R2 (every 30 seconds)..."
+    (
+        while true; do
+            # Sync workspace
+            if [ -d "/root/clawd" ]; then
+                rsync -a --delete /root/clawd/ "$BACKUP_DIR/workspace/" 2>/dev/null || true
+            fi
+            # Sync config
+            if [ -d "$CONFIG_DIR" ]; then
+                rsync -a --delete "$CONFIG_DIR/" "$BACKUP_DIR/config/" 2>/dev/null || true
+            fi
+            # Update sync timestamp
+            date -Iseconds > "$BACKUP_DIR/.last-sync" 2>/dev/null || true
+            sleep 30
+        done
+    ) &
+    echo "Background sync started (PID: $!)"
+else
+    echo "R2 not mounted, skipping background sync"
+fi
+
+# ============================================================
 # START GATEWAY
 # ============================================================
-# Note: R2 backup sync is handled by the Worker's cron trigger
 echo "Starting Moltbot Gateway..."
 echo "Gateway will be available on port 18789"
 
@@ -292,3 +337,4 @@ else
     exec clawdbot gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE"
 fi
 # Rebuild marker: 1769727830
+# Rebuild: 1769729813
