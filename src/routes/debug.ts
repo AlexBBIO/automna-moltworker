@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { findExistingMoltbotProcess } from '../gateway';
+import { getRecentLogs } from '../logging';
 
 /**
  * Debug routes for inspecting container state
@@ -461,6 +462,22 @@ debug.get('/container-config', async (c) => {
       config,
       raw: config ? undefined : stdout,
       stderr,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /debug/persistent-logs - View logs stored in R2
+debug.get('/persistent-logs', async (c) => {
+  const limit = parseInt(c.req.query('limit') || '50', 10);
+  
+  try {
+    const logs = await getRecentLogs(c.env, Math.min(limit, 200));
+    return c.json({
+      count: logs.length,
+      logs,
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';

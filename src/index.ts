@@ -30,6 +30,7 @@ import { ensureMoltbotGateway, findExistingMoltbotProcess, syncToR2 } from './ga
 import { publicRoutes, api, adminUi, debug, cdp } from './routes';
 import loadingPageHtml from './assets/loading.html';
 import configErrorHtml from './assets/config-error.html';
+import { createLogger } from './logging';
 
 /**
  * Transform error messages from the gateway to be more user-friendly.
@@ -110,6 +111,34 @@ const app = new Hono<AppEnv>();
 // =============================================================================
 // MIDDLEWARE: Applied to ALL routes
 // =============================================================================
+
+// Middleware: CORS for cross-origin requests from automna.ai
+app.use('*', async (c, next) => {
+  const origin = c.req.header('Origin');
+  const allowedOrigins = ['https://automna.ai', 'https://www.automna.ai', 'http://localhost:3000'];
+  
+  // Handle preflight OPTIONS requests
+  if (c.req.method === 'OPTIONS') {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': allowedOrigins.includes(origin || '') ? origin! : allowedOrigins[0],
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Max-Age': '86400',
+      },
+    });
+  }
+  
+  await next();
+  
+  // Add CORS headers to response
+  if (origin && allowedOrigins.includes(origin)) {
+    c.res.headers.set('Access-Control-Allow-Origin', origin);
+    c.res.headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    c.res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  }
+});
 
 // Middleware: Log every request
 app.use('*', async (c, next) => {
@@ -237,6 +266,10 @@ app.use('*', async (c, next) => {
 
 // Mount API routes (protected by Cloudflare Access)
 app.route('/api', api);
+
+// Alias /ws/api/* to /api/* for webchat client compatibility
+// The webchat client requests /ws/api/history but our endpoint is /api/history
+app.route('/ws/api', api);
 
 // Mount Admin UI routes (protected by Cloudflare Access)
 app.route('/_admin', adminUi);
@@ -461,16 +494,23 @@ async function scheduled(
   env: MoltbotEnv,
   _ctx: ExecutionContext
 ): Promise<void> {
-  const options = buildSandboxOptions(env);
-  const sandbox = getSandbox(env.Sandbox, 'shared', options);
-
-  console.log('[cron] Starting admin sandbox backup sync to R2...');
-  const result = await syncToR2(sandbox, env);
+  const logger = createLogger(env, 'cron');
   
-  if (result.success) {
-    console.log('[cron] Admin backup sync completed successfully at', result.lastSync);
-  } else {
-    console.error('[cron] Admin backup sync failed:', result.error, result.details || '');
+  try {
+    const options = buildSandboxOptions(env);
+    const sandbox = getSandbox(env.Sandbox, 'shared', options);
+
+    logger.info('Starting admin sandbox backup sync to R2...');
+    const result = await syncToR2(sandbox, env);
+    
+    if (result.success) {
+      logger.info('Admin backup sync completed successfully', { lastSync: result.lastSync });
+    } else {
+      logger.error('Admin backup sync failed', { error: result.error, details: result.details });
+    }
+  } catch (error) {
+    logger.error('Scheduled handler crashed', {}, error instanceof Error ? error : new Error(String(error)));
+    throw error;
   }
 }
 
