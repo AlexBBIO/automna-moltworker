@@ -26,7 +26,7 @@ import { getSandbox, Sandbox, type SandboxOptions } from '@cloudflare/sandbox';
 import type { AppEnv, MoltbotEnv } from './types';
 import { MOLTBOT_PORT } from './config';
 import { createAccessMiddleware, validateSignedUrl } from './auth';
-import { ensureMoltbotGateway, findExistingMoltbotProcess, syncToR2 } from './gateway';
+import { ensureMoltbotGateway, findExistingMoltbotProcess, syncToR2, waitForProcess } from './gateway';
 import { publicRoutes, api, adminUi, debug, cdp } from './routes';
 import loadingPageHtml from './assets/loading.html';
 import configErrorHtml from './assets/config-error.html';
@@ -509,7 +509,6 @@ app.get('/ws/api/history', async (c) => {
       console.log(JSON.stringify({ sessionKey: '${sessionKey}', messages: limited, source: 'container', limit: limit }));
     `;
     
-    const { waitForProcess } = await import('./gateway');
     const proc = await sandbox.startProcess(
       'node -e ' + JSON.stringify(script.replace(/\n/g, ' '))
     );
@@ -517,6 +516,21 @@ app.get('/ws/api/history', async (c) => {
     
     const logs = await proc.getLogs();
     const elapsed = Date.now() - startTime;
+    
+    // Trigger R2 sync in background so next load is fast
+    // Don't await - let it happen async
+    c.executionCtx.waitUntil(
+      syncToR2(sandbox, c.env, { userId }).then(syncResult => {
+        if (syncResult.success) {
+          console.log(`[history] Background sync completed for user ${userId}`);
+        } else {
+          console.warn(`[history] Background sync failed: ${syncResult.error}`);
+        }
+      }).catch(err => {
+        console.warn(`[history] Background sync error:`, err);
+      })
+    );
+    
     try {
       const result = JSON.parse(logs.stdout || '{}');
       result.elapsed = elapsed;
