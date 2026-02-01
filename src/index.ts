@@ -290,13 +290,245 @@ app.get('/api/history', async (c) => {
   }
 });
 
-// Alias for webchat client compatibility
+// =============================================================================
+// HISTORY ENDPOINT: Fast R2 path, falls back to container
+// =============================================================================
+
+// Security: Max file size to prevent OOM (5MB)
+const MAX_HISTORY_FILE_SIZE = 5 * 1024 * 1024;
+// Scalability: Default message limit (can be overridden via query param, max 200)
+const DEFAULT_MESSAGE_LIMIT = 50;
+const MAX_MESSAGE_LIMIT = 200;
+
+/**
+ * Validate and sanitize session key to prevent path traversal
+ * Only allows alphanumeric, dash, underscore, and dot (no slashes or ..)
+ */
+function sanitizeSessionKey(sessionKey: string): string | null {
+  // Must be non-empty and reasonable length
+  if (!sessionKey || sessionKey.length > 100) {
+    return null;
+  }
+  // Only allow safe characters: alphanumeric, dash, underscore, dot
+  // Explicitly reject path traversal attempts
+  if (!/^[a-zA-Z0-9_.-]+$/.test(sessionKey) || sessionKey.includes('..')) {
+    return null;
+  }
+  return sessionKey;
+}
+
+/**
+ * Validate that an R2 path is within the user's directory
+ */
+function isPathWithinUserDir(path: string, userId: string): boolean {
+  const expectedPrefix = `users/${userId}/`;
+  // Normalize and check prefix
+  const normalized = path.replace(/\/+/g, '/');
+  return normalized.startsWith(expectedPrefix) && !normalized.includes('..');
+}
+
+/**
+ * Parse JSONL content into messages array with limit
+ */
+function parseJSONLHistory(
+  content: string, 
+  limit: number = DEFAULT_MESSAGE_LIMIT
+): Array<{ role: string; content: unknown; timestamp?: number }> {
+  const messages: Array<{ role: string; content: unknown; timestamp?: number }> = [];
+  const lines = content.split(/\r?\n/);
+  
+  // Parse all messages first
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line);
+      // Handle both formats: { message: {...} } and direct { role, content }
+      const msg = parsed.message || parsed;
+      if (msg && (msg.role === 'user' || msg.role === 'assistant')) {
+        messages.push({
+          role: msg.role,
+          content: msg.content,
+          timestamp: parsed.timestamp || msg.timestamp,
+        });
+      }
+    } catch {
+      // Skip invalid JSON lines
+    }
+  }
+  
+  // Return only the last N messages (most recent)
+  if (messages.length > limit) {
+    return messages.slice(-limit);
+  }
+  
+  return messages;
+}
+
+app.options('/ws/api/history', (c) => {
+  c.header('Access-Control-Allow-Origin', '*');
+  c.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  c.header('Access-Control-Allow-Headers', 'Content-Type');
+  return c.text('', 204);
+});
+
 app.get('/ws/api/history', async (c) => {
-  // Forward to /api/history handler by reconstructing the URL
-  const url = new URL(c.req.url);
-  url.pathname = '/api/history';
-  const newReq = new Request(url.toString(), c.req.raw);
-  return app.fetch(newReq, c.env, c.executionCtx);
+  // Add CORS headers
+  c.header('Access-Control-Allow-Origin', '*');
+  c.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  c.header('Access-Control-Allow-Headers', 'Content-Type');
+  
+  const userId = c.get('userId');
+  const rawSessionKey = c.req.query('sessionKey') || 'main';
+  const limitParam = parseInt(c.req.query('limit') || String(DEFAULT_MESSAGE_LIMIT), 10);
+  const limit = Math.min(Math.max(1, limitParam), MAX_MESSAGE_LIMIT);
+  
+  // Security: Validate session key
+  const sessionKey = sanitizeSessionKey(rawSessionKey);
+  if (!sessionKey) {
+    return c.json({ error: 'Invalid session key' }, 400);
+  }
+  
+  console.log(`[history] Request for user=${userId}, session=${sessionKey}, limit=${limit}`);
+  
+  if (!userId) {
+    return c.json({ error: 'Not authenticated' }, 401);
+  }
+
+  // === FAST PATH: Read directly from R2 (no container boot) ===
+  const startTime = Date.now();
+  try {
+    const bucket = c.env.MOLTBOT_BUCKET;
+    if (bucket) {
+      // First, read sessions.json to find the session file path
+      const sessionsKey = `users/${userId}/clawdbot/agents/main/sessions/sessions.json`;
+      
+      // Security: Validate path is within user directory
+      if (!isPathWithinUserDir(sessionsKey, userId)) {
+        console.error(`[history] Path validation failed: ${sessionsKey}`);
+        return c.json({ error: 'Invalid path' }, 400);
+      }
+      
+      console.log(`[history] R2 lookup: ${sessionsKey}`);
+      const sessionsObj = await bucket.get(sessionsKey);
+      
+      if (sessionsObj) {
+        const sessionsData = JSON.parse(await sessionsObj.text());
+        const sessionEntry = sessionsData[sessionKey];
+        console.log(`[history] Session entry:`, sessionEntry ? 'found' : 'not found');
+        
+        if (sessionEntry?.sessionFile) {
+          // Extract the relative path from the session file
+          // sessionFile is like "/root/.clawdbot/agents/main/sessions/main/history.jsonl"
+          // We need "agents/main/sessions/main/history.jsonl"
+          const relativePath = sessionEntry.sessionFile.replace(/^\/root\/\.clawdbot\//, '');
+          const historyKey = `users/${userId}/clawdbot/${relativePath}`;
+          
+          // Security: Validate path is within user directory
+          if (!isPathWithinUserDir(historyKey, userId)) {
+            console.error(`[history] Path validation failed: ${historyKey}`);
+            return c.json({ error: 'Invalid history path' }, 400);
+          }
+          
+          console.log(`[history] R2 history key: ${historyKey}`);
+          
+          const historyObj = await bucket.get(historyKey);
+          if (historyObj) {
+            // Scalability: Check file size before loading
+            if (historyObj.size > MAX_HISTORY_FILE_SIZE) {
+              console.warn(`[history] File too large: ${historyObj.size} bytes`);
+              // Still try to load, but this is a warning
+            }
+            
+            const content = await historyObj.text();
+            const messages = parseJSONLHistory(content, limit);
+            const elapsed = Date.now() - startTime;
+            console.log(`[history] R2 fast path: ${messages.length} messages in ${elapsed}ms`);
+            return c.json({ sessionKey, messages, source: 'r2', elapsed, limit });
+          } else {
+            console.log(`[history] R2 history file not found`);
+          }
+        }
+      } else {
+        console.log(`[history] R2 sessions.json not found`);
+      }
+    } else {
+      console.log(`[history] No R2 bucket binding`);
+    }
+  } catch (err) {
+    console.warn('[history] R2 read failed:', err);
+  }
+
+  // === SLOW PATH: Fall back to container ===
+  console.log(`[history] Falling back to container path`);
+  const sandbox = c.get('sandbox');
+  
+  try {
+    // Ensure gateway is running
+    await ensureMoltbotGateway(sandbox, c.env, userId);
+    
+    // Read sessions.json and find the JSONL file for this session
+    // Note: sessionKey is already sanitized above
+    const script = `
+      const fs = require('fs');
+      const storePath = '/root/.clawdbot/agents/main/sessions/sessions.json';
+      if (!fs.existsSync(storePath)) {
+        console.log(JSON.stringify({ error: 'sessions.json not found' }));
+        process.exit(0);
+      }
+      const store = JSON.parse(fs.readFileSync(storePath, 'utf-8'));
+      const entry = store['${sessionKey}'];
+      if (!entry) {
+        console.log(JSON.stringify({ error: 'session not found', keys: Object.keys(store) }));
+        process.exit(0);
+      }
+      const sessionFile = entry.sessionFile;
+      if (!fs.existsSync(sessionFile)) {
+        console.log(JSON.stringify({ error: 'JSONL file not found', sessionFile }));
+        process.exit(0);
+      }
+      const stat = fs.statSync(sessionFile);
+      if (stat.size > ${MAX_HISTORY_FILE_SIZE}) {
+        console.log(JSON.stringify({ error: 'History file too large', size: stat.size }));
+        process.exit(0);
+      }
+      const lines = fs.readFileSync(sessionFile, 'utf-8').split(/\\r?\\n/);
+      const messages = [];
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const parsed = JSON.parse(line);
+          const msg = parsed.message || parsed;
+          if (msg && (msg.role === 'user' || msg.role === 'assistant')) {
+            messages.push({ role: msg.role, content: msg.content, timestamp: parsed.timestamp || msg.timestamp });
+          }
+        } catch {}
+      }
+      // Return only last N messages
+      const limit = ${limit};
+      const limited = messages.length > limit ? messages.slice(-limit) : messages;
+      console.log(JSON.stringify({ sessionKey: '${sessionKey}', messages: limited, source: 'container', limit: limit }));
+    `;
+    
+    const { waitForProcess } = await import('./gateway');
+    const proc = await sandbox.startProcess(
+      'node -e ' + JSON.stringify(script.replace(/\n/g, ' '))
+    );
+    await waitForProcess(proc, 10000);
+    
+    const logs = await proc.getLogs();
+    const elapsed = Date.now() - startTime;
+    try {
+      const result = JSON.parse(logs.stdout || '{}');
+      result.elapsed = elapsed;
+      return c.json(result);
+    } catch {
+      return c.json({ error: 'Failed to parse output', stdout: logs.stdout, stderr: logs.stderr, elapsed }, 500);
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    const elapsed = Date.now() - startTime;
+    return c.json({ error: errorMessage, elapsed }, 500);
+  }
 });
 
 // =============================================================================
