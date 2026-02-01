@@ -355,6 +355,85 @@ app.options('/api/keepalive', (c) => {
 });
 
 // =============================================================================
+// CHAT SEND ENDPOINT: HTTP fallback for when WebSocket fails
+// =============================================================================
+
+app.options('/api/chat/send', (c) => {
+  c.header('Access-Control-Allow-Origin', 'https://automna.ai');
+  c.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  c.header('Access-Control-Allow-Headers', 'Content-Type');
+  return c.text('', 204);
+});
+
+app.post('/api/chat/send', async (c) => {
+  const url = new URL(c.req.url);
+  
+  c.header('Access-Control-Allow-Origin', 'https://automna.ai');
+  c.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  c.header('Access-Control-Allow-Headers', 'Content-Type');
+  
+  // Check for signed URL params
+  const userId = url.searchParams.get('userId');
+  const exp = url.searchParams.get('exp');
+  const sig = url.searchParams.get('sig');
+  
+  if (!userId || !exp || !sig) {
+    return c.json({ error: 'Missing auth params' }, 401);
+  }
+  
+  // Validate signature
+  if (c.env.MOLTBOT_SIGNING_SECRET) {
+    const validation = await validateSignedUrl(url, c.env.MOLTBOT_SIGNING_SECRET);
+    if (!validation.valid) {
+      return c.json({ error: 'Unauthorized', details: validation.error }, 401);
+    }
+  }
+  
+  // Get request body
+  const body = await c.req.json<{ message: string; sessionKey?: string }>();
+  const message = body.message?.trim();
+  const sessionKey = body.sessionKey || 'main';
+  
+  if (!message) {
+    return c.json({ error: 'Message is required' }, 400);
+  }
+  
+  // Get sandbox
+  const options = buildSandboxOptions(c.env);
+  const sandboxId = `user-${userId}`.toLowerCase();
+  const sandbox = getSandbox(c.env.Sandbox, sandboxId, { ...options, normalizeId: true });
+  
+  try {
+    await ensureMoltbotGateway(sandbox, c.env, userId);
+    
+    // Send message via CLI command
+    const gatewayToken = c.env.MOLTBOT_GATEWAY_TOKEN || '';
+    const tokenArg = gatewayToken ? `--token "${gatewayToken}"` : '';
+    const escapedMessage = message.replace(/"/g, '\\"').replace(/\n/g, '\\n');
+    
+    const cmd = `clawdbot gateway send ${tokenArg} --session "${sessionKey}" "${escapedMessage}"`;
+    console.log('[chat/send] Executing:', cmd.replace(gatewayToken, '***'));
+    
+    const proc = await sandbox.startProcess(cmd);
+    await waitForProcess(proc, 60000);
+    
+    const logs = await proc.getLogs();
+    console.log('[chat/send] stdout:', logs.stdout?.slice(0, 500));
+    console.log('[chat/send] stderr:', logs.stderr?.slice(0, 500));
+    
+    return c.json({ 
+      ok: true, 
+      sessionKey,
+      timestamp: Date.now()
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error('[chat/send] Error:', errorMessage);
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// =============================================================================
 // PROTECTED ROUTES: Cloudflare Access authentication required
 // =============================================================================
 
