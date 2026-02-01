@@ -591,4 +591,513 @@ api.post('/reset-workspace', async (c) => {
   }
 });
 
+// ============================================
+// FILE MANAGEMENT APIs
+// ============================================
+
+const WORKSPACE_ROOT = '/root/clawd';
+const MAX_FILE_SIZE = 10 * 1024 * 1024;  // 10MB
+const MAX_UPLOAD_SIZE = 50 * 1024 * 1024;  // 50MB
+
+/**
+ * Validate that a path is within the workspace and safe to access
+ */
+function validateFilePath(path: string): { valid: boolean; normalized: string; error?: string } {
+  // Normalize path - remove duplicate slashes, trailing slash
+  const normalized = path.replace(/\/+/g, '/').replace(/\/$/, '');
+  
+  // Must be within workspace root
+  if (!normalized.startsWith(WORKSPACE_ROOT)) {
+    return { valid: false, normalized, error: 'Path must be within workspace' };
+  }
+  
+  // No path traversal
+  if (normalized.includes('..')) {
+    return { valid: false, normalized, error: 'Path traversal not allowed' };
+  }
+  
+  // No access to Clawdbot internals
+  if (normalized.startsWith('/root/.clawdbot')) {
+    return { valid: false, normalized, error: 'Cannot access Clawdbot internals' };
+  }
+  
+  return { valid: true, normalized };
+}
+
+/**
+ * GET /api/files/list - List directory contents
+ */
+api.get('/files/list', async (c) => {
+  const sandbox = c.get('sandbox');
+  const path = c.req.query('path') || WORKSPACE_ROOT;
+  
+  const { valid, normalized, error } = validateFilePath(path);
+  if (!valid) return c.json({ error }, 400);
+  
+  try {
+    // Use find command to get file info: type|size|mtime|name
+    const cmd = `find "${normalized}" -maxdepth 1 -printf "%y|%s|%T@|%f\\n" 2>/dev/null | tail -n +2 | head -500`;
+    const proc = await sandbox.startProcess(cmd);
+    await waitForProcess(proc, 15000);
+    const logs = await proc.getLogs();
+    
+    const files = (logs.stdout?.split('\n').filter(Boolean) || []).map(line => {
+      const [type, size, mtime, name] = line.split('|');
+      const filePath = normalized === '/' ? `/${name}` : `${normalized}/${name}`;
+      return {
+        name,
+        path: filePath,
+        type: type === 'd' ? 'directory' : 'file',
+        size: parseInt(size) || 0,
+        modified: new Date(parseFloat(mtime) * 1000).toISOString(),
+        extension: type !== 'd' ? (name.split('.').pop() || '') : undefined,
+      };
+    });
+    
+    // Sort: directories first, then alphabetically
+    files.sort((a, b) => {
+      if (a.type === 'directory' && b.type !== 'directory') return -1;
+      if (a.type !== 'directory' && b.type === 'directory') return 1;
+      return a.name.localeCompare(b.name);
+    });
+    
+    return c.json({ 
+      path: normalized, 
+      files,
+      parent: normalized === WORKSPACE_ROOT ? null : normalized.substring(0, normalized.lastIndexOf('/')) || '/',
+    });
+  } catch (err) {
+    console.error('File list error:', err);
+    return c.json({ error: 'Failed to list directory' }, 500);
+  }
+});
+
+/**
+ * GET /api/files/read - Read file contents
+ */
+api.get('/files/read', async (c) => {
+  const sandbox = c.get('sandbox');
+  const path = c.req.query('path');
+  const encoding = c.req.query('encoding') || 'utf-8';
+  
+  if (!path) return c.json({ error: 'Path required' }, 400);
+  
+  const { valid, normalized, error } = validateFilePath(path);
+  if (!valid) return c.json({ error }, 400);
+  
+  try {
+    // Check file exists and get size
+    const statProc = await sandbox.startProcess(`stat -c "%s|%Y" "${normalized}" 2>/dev/null || echo "NOT_FOUND"`);
+    await waitForProcess(statProc, 5000);
+    const statLogs = await statProc.getLogs();
+    const statOutput = statLogs.stdout?.trim() || '';
+    
+    if (statOutput === 'NOT_FOUND' || !statOutput) {
+      return c.json({ error: 'File not found' }, 404);
+    }
+    
+    const [sizeStr, mtimeStr] = statOutput.split('|');
+    const size = parseInt(sizeStr) || 0;
+    
+    if (size > MAX_FILE_SIZE) {
+      return c.json({ 
+        error: 'File too large', 
+        size, 
+        maxSize: MAX_FILE_SIZE,
+        hint: 'Use download endpoint for large files'
+      }, 413);
+    }
+    
+    // Read file content
+    const readCmd = encoding === 'base64' 
+      ? `base64 "${normalized}"`
+      : `cat "${normalized}"`;
+    const proc = await sandbox.startProcess(readCmd);
+    await waitForProcess(proc, 30000);
+    const logs = await proc.getLogs();
+    
+    return c.json({
+      path: normalized,
+      content: logs.stdout || '',
+      size,
+      modified: new Date(parseInt(mtimeStr) * 1000).toISOString(),
+      encoding,
+    });
+  } catch (err) {
+    console.error('File read error:', err);
+    return c.json({ error: 'Failed to read file' }, 500);
+  }
+});
+
+/**
+ * POST /api/files/write - Write file contents
+ */
+api.post('/files/write', async (c) => {
+  const sandbox = c.get('sandbox');
+  
+  let body;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+  
+  const { path, content, encoding = 'utf-8', createDirs = true } = body;
+  
+  if (!path || content === undefined) {
+    return c.json({ error: 'Path and content required' }, 400);
+  }
+  
+  const { valid, normalized, error } = validateFilePath(path);
+  if (!valid) return c.json({ error }, 400);
+  
+  // Check content size
+  const contentSize = encoding === 'base64' 
+    ? Math.ceil(content.length * 0.75)  // Approximate decoded size
+    : Buffer.from(content).length;
+  
+  if (contentSize > MAX_FILE_SIZE) {
+    return c.json({ 
+      error: 'Content too large', 
+      size: contentSize, 
+      maxSize: MAX_FILE_SIZE 
+    }, 413);
+  }
+  
+  try {
+    // Create parent directories if needed
+    if (createDirs) {
+      const dir = normalized.substring(0, normalized.lastIndexOf('/'));
+      if (dir) {
+        const mkdirProc = await sandbox.startProcess(`mkdir -p "${dir}"`);
+        await waitForProcess(mkdirProc, 5000);
+      }
+    }
+    
+    // Write file
+    if (encoding === 'base64') {
+      // Write binary via base64 decode
+      const proc = await sandbox.startProcess(`echo "${content}" | base64 -d > "${normalized}"`);
+      await waitForProcess(proc, 30000);
+    } else {
+      // Write text using a temp file to handle special characters safely
+      const escapedContent = content.replace(/'/g, "'\"'\"'");
+      const proc = await sandbox.startProcess(`printf '%s' '${escapedContent}' > "${normalized}"`);
+      await waitForProcess(proc, 30000);
+    }
+    
+    // Get new file stats
+    const statProc = await sandbox.startProcess(`stat -c "%s|%Y" "${normalized}"`);
+    await waitForProcess(statProc, 5000);
+    const statLogs = await statProc.getLogs();
+    const [size, mtime] = (statLogs.stdout?.trim() || '0|0').split('|');
+    
+    return c.json({
+      success: true,
+      path: normalized,
+      size: parseInt(size),
+      modified: new Date(parseInt(mtime) * 1000).toISOString(),
+    });
+  } catch (err) {
+    console.error('File write error:', err);
+    return c.json({ error: 'Failed to write file' }, 500);
+  }
+});
+
+/**
+ * POST /api/files/upload - Upload file (multipart form data)
+ */
+api.post('/files/upload', async (c) => {
+  const sandbox = c.get('sandbox');
+  
+  let formData;
+  try {
+    formData = await c.req.formData();
+  } catch {
+    return c.json({ error: 'Invalid form data' }, 400);
+  }
+  
+  const file = formData.get('file') as File | null;
+  const targetPath = formData.get('path') as string | null;
+  
+  if (!file || !targetPath) {
+    return c.json({ error: 'File and path required' }, 400);
+  }
+  
+  const { valid, normalized, error } = validateFilePath(targetPath);
+  if (!valid) return c.json({ error }, 400);
+  
+  if (file.size > MAX_UPLOAD_SIZE) {
+    return c.json({ 
+      error: 'File too large', 
+      size: file.size, 
+      maxSize: MAX_UPLOAD_SIZE 
+    }, 413);
+  }
+  
+  try {
+    // Create parent directory
+    const dir = normalized.substring(0, normalized.lastIndexOf('/'));
+    if (dir) {
+      const mkdirProc = await sandbox.startProcess(`mkdir -p "${dir}"`);
+      await waitForProcess(mkdirProc, 5000);
+    }
+    
+    // Read file as base64 and write via decode
+    const bytes = await file.arrayBuffer();
+    const base64 = btoa(String.fromCharCode(...new Uint8Array(bytes)));
+    
+    // For large files, write in chunks to avoid command line limits
+    const CHUNK_SIZE = 50000; // ~50KB chunks
+    if (base64.length > CHUNK_SIZE) {
+      // Write chunks to temp file, then decode
+      const tempFile = `/tmp/upload_${Date.now()}`;
+      for (let i = 0; i < base64.length; i += CHUNK_SIZE) {
+        const chunk = base64.slice(i, i + CHUNK_SIZE);
+        const op = i === 0 ? '>' : '>>';
+        const chunkProc = await sandbox.startProcess(`printf '%s' '${chunk}' ${op} "${tempFile}"`);
+        await waitForProcess(chunkProc, 10000);
+      }
+      // Decode temp file to final destination
+      const decodeProc = await sandbox.startProcess(`base64 -d "${tempFile}" > "${normalized}" && rm "${tempFile}"`);
+      await waitForProcess(decodeProc, 60000);
+    } else {
+      // Small file - single command
+      const proc = await sandbox.startProcess(`printf '%s' '${base64}' | base64 -d > "${normalized}"`);
+      await waitForProcess(proc, 60000);
+    }
+    
+    return c.json({
+      success: true,
+      path: normalized,
+      size: file.size,
+      mimeType: file.type || 'application/octet-stream',
+    });
+  } catch (err) {
+    console.error('File upload error:', err);
+    return c.json({ error: 'Upload failed' }, 500);
+  }
+});
+
+/**
+ * GET /api/files/download - Download file as binary
+ */
+api.get('/files/download', async (c) => {
+  const sandbox = c.get('sandbox');
+  const path = c.req.query('path');
+  
+  if (!path) return c.json({ error: 'Path required' }, 400);
+  
+  const { valid, normalized, error } = validateFilePath(path);
+  if (!valid) return c.json({ error }, 400);
+  
+  try {
+    // Check file exists
+    const checkProc = await sandbox.startProcess(`test -f "${normalized}" && echo "EXISTS" || echo "NOT_FOUND"`);
+    await waitForProcess(checkProc, 5000);
+    const checkLogs = await checkProc.getLogs();
+    
+    if (checkLogs.stdout?.trim() !== 'EXISTS') {
+      return c.json({ error: 'File not found' }, 404);
+    }
+    
+    // Read file as base64
+    const proc = await sandbox.startProcess(`base64 "${normalized}"`);
+    await waitForProcess(proc, 120000); // 2 min timeout for large files
+    const logs = await proc.getLogs();
+    
+    const base64Content = logs.stdout?.replace(/\s/g, '') || '';
+    const binaryString = atob(base64Content);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    
+    const filename = normalized.split('/').pop() || 'download';
+    
+    // Guess content type from extension
+    const ext = filename.split('.').pop()?.toLowerCase() || '';
+    const contentTypes: Record<string, string> = {
+      'pdf': 'application/pdf',
+      'png': 'image/png',
+      'jpg': 'image/jpeg',
+      'jpeg': 'image/jpeg',
+      'gif': 'image/gif',
+      'webp': 'image/webp',
+      'svg': 'image/svg+xml',
+      'json': 'application/json',
+      'md': 'text/markdown',
+      'txt': 'text/plain',
+      'html': 'text/html',
+      'css': 'text/css',
+      'js': 'text/javascript',
+      'ts': 'text/typescript',
+      'py': 'text/x-python',
+      'csv': 'text/csv',
+      'xml': 'application/xml',
+      'zip': 'application/zip',
+    };
+    const contentType = contentTypes[ext] || 'application/octet-stream';
+    
+    return new Response(bytes, {
+      headers: {
+        'Content-Type': contentType,
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length': bytes.length.toString(),
+      },
+    });
+  } catch (err) {
+    console.error('File download error:', err);
+    return c.json({ error: 'Download failed' }, 500);
+  }
+});
+
+/**
+ * DELETE /api/files - Delete file (move to trash)
+ */
+api.delete('/files', async (c) => {
+  const sandbox = c.get('sandbox');
+  const path = c.req.query('path');
+  const permanent = c.req.query('permanent') === 'true';
+  
+  if (!path) return c.json({ error: 'Path required' }, 400);
+  
+  const { valid, normalized, error } = validateFilePath(path);
+  if (!valid) return c.json({ error }, 400);
+  
+  // Don't allow deleting workspace root or critical files
+  const protectedPaths = [WORKSPACE_ROOT, `${WORKSPACE_ROOT}/SOUL.md`, `${WORKSPACE_ROOT}/AGENTS.md`];
+  if (protectedPaths.includes(normalized)) {
+    return c.json({ error: 'Cannot delete protected path' }, 403);
+  }
+  
+  try {
+    // Check if path exists
+    const checkProc = await sandbox.startProcess(`test -e "${normalized}" && echo "EXISTS" || echo "NOT_FOUND"`);
+    await waitForProcess(checkProc, 5000);
+    const checkLogs = await checkProc.getLogs();
+    
+    if (checkLogs.stdout?.trim() !== 'EXISTS') {
+      return c.json({ error: 'Path not found' }, 404);
+    }
+    
+    if (permanent) {
+      // Permanent delete
+      const proc = await sandbox.startProcess(`rm -rf "${normalized}"`);
+      await waitForProcess(proc, 10000);
+      
+      return c.json({ success: true, path: normalized, permanent: true });
+    } else {
+      // Move to trash
+      const trashDir = `${WORKSPACE_ROOT}/.trash`;
+      const timestamp = Date.now();
+      const filename = normalized.split('/').pop();
+      const trashPath = `${trashDir}/${filename}.${timestamp}`;
+      
+      const mkdirProc = await sandbox.startProcess(`mkdir -p "${trashDir}"`);
+      await waitForProcess(mkdirProc, 5000);
+      
+      const mvProc = await sandbox.startProcess(`mv "${normalized}" "${trashPath}"`);
+      await waitForProcess(mvProc, 10000);
+      
+      return c.json({
+        success: true,
+        path: normalized,
+        trashPath,
+        trashedAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+      });
+    }
+  } catch (err) {
+    console.error('File delete error:', err);
+    return c.json({ error: 'Delete failed' }, 500);
+  }
+});
+
+/**
+ * POST /api/files/mkdir - Create directory
+ */
+api.post('/files/mkdir', async (c) => {
+  const sandbox = c.get('sandbox');
+  
+  let body;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+  
+  const { path } = body;
+  
+  if (!path) return c.json({ error: 'Path required' }, 400);
+  
+  const { valid, normalized, error } = validateFilePath(path);
+  if (!valid) return c.json({ error }, 400);
+  
+  try {
+    const proc = await sandbox.startProcess(`mkdir -p "${normalized}"`);
+    await waitForProcess(proc, 10000);
+    
+    return c.json({ success: true, path: normalized });
+  } catch (err) {
+    console.error('Mkdir error:', err);
+    return c.json({ error: 'Failed to create directory' }, 500);
+  }
+});
+
+/**
+ * POST /api/files/move - Move/rename file or directory
+ */
+api.post('/files/move', async (c) => {
+  const sandbox = c.get('sandbox');
+  
+  let body;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+  
+  const { from, to } = body;
+  
+  if (!from || !to) return c.json({ error: 'From and to paths required' }, 400);
+  
+  const fromValidation = validateFilePath(from);
+  if (!fromValidation.valid) return c.json({ error: fromValidation.error }, 400);
+  
+  const toValidation = validateFilePath(to);
+  if (!toValidation.valid) return c.json({ error: toValidation.error }, 400);
+  
+  try {
+    // Check source exists
+    const checkProc = await sandbox.startProcess(`test -e "${fromValidation.normalized}" && echo "EXISTS" || echo "NOT_FOUND"`);
+    await waitForProcess(checkProc, 5000);
+    const checkLogs = await checkProc.getLogs();
+    
+    if (checkLogs.stdout?.trim() !== 'EXISTS') {
+      return c.json({ error: 'Source path not found' }, 404);
+    }
+    
+    // Create parent directory for destination if needed
+    const toDir = toValidation.normalized.substring(0, toValidation.normalized.lastIndexOf('/'));
+    if (toDir) {
+      const mkdirProc = await sandbox.startProcess(`mkdir -p "${toDir}"`);
+      await waitForProcess(mkdirProc, 5000);
+    }
+    
+    // Move file
+    const mvProc = await sandbox.startProcess(`mv "${fromValidation.normalized}" "${toValidation.normalized}"`);
+    await waitForProcess(mvProc, 10000);
+    
+    return c.json({
+      success: true,
+      from: fromValidation.normalized,
+      to: toValidation.normalized,
+    });
+  } catch (err) {
+    console.error('File move error:', err);
+    return c.json({ error: 'Move failed' }, 500);
+  }
+});
+
 export { api };
