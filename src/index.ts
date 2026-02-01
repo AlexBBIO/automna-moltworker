@@ -462,9 +462,17 @@ app.get('/ws/api/history', async (c) => {
   console.log(`[history] Falling back to container path`);
   const sandbox = c.get('sandbox');
   
+  // Timeout for container path (30 seconds max)
+  const CONTAINER_TIMEOUT_MS = 30000;
+  
   try {
-    // Ensure gateway is running
-    await ensureMoltbotGateway(sandbox, c.env, userId);
+    // Ensure gateway is running (with timeout to prevent hang)
+    const gatewayPromise = ensureMoltbotGateway(sandbox, c.env, userId);
+    const timeoutPromise = new Promise<never>((_, reject) => 
+      setTimeout(() => reject(new Error('Container startup timeout (30s)')), CONTAINER_TIMEOUT_MS)
+    );
+    
+    await Promise.race([gatewayPromise, timeoutPromise]);
     
     // Read sessions.json and find the JSONL file for this session
     // Note: sessionKey is already sanitized above
@@ -582,10 +590,25 @@ app.get('/api/keepalive', async (c) => {
   
   try {
     await ensureMoltbotGateway(sandbox, c.env, userId);
+    
+    // Trigger R2 sync in background (keeps data fresh for fast history loads)
+    c.executionCtx.waitUntil(
+      syncToR2(sandbox, c.env, { userId }).then(syncResult => {
+        if (syncResult.success) {
+          console.log(`[keepalive] R2 sync completed for user ${userId}`);
+        } else {
+          console.warn(`[keepalive] R2 sync failed: ${syncResult.error}`);
+        }
+      }).catch(err => {
+        console.warn(`[keepalive] R2 sync error:`, err);
+      })
+    );
+    
     return c.json({ 
       status: 'alive', 
       userId: userId,
-      timestamp: Date.now() 
+      timestamp: Date.now(),
+      syncing: true  // Indicates R2 sync was triggered
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
