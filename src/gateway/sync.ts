@@ -82,9 +82,10 @@ export async function syncToR2(
     console.error('[SYNC] Failed to create user directory:', err);
   }
 
-  // Run rsync to backup config to R2
+  // Run rsync to backup config, skills, AND full workspace to R2
   // Note: Use --no-times because s3fs doesn't support setting timestamps
-  const syncCmd = `rsync -r --no-times --delete --exclude='*.lock' --exclude='*.log' --exclude='*.tmp' /root/.clawdbot/ ${userR2Path}/clawdbot/ && rsync -r --no-times --delete /root/clawd/skills/ ${userR2Path}/skills/ && date -Iseconds > ${userR2Path}/.last-sync`;
+  // Sync order: clawdbot config → skills → full workspace
+  const syncCmd = `rsync -r --no-times --delete --exclude='*.lock' --exclude='*.log' --exclude='*.tmp' /root/.clawdbot/ ${userR2Path}/clawdbot/ && rsync -r --no-times --delete /root/clawd/skills/ ${userR2Path}/skills/ && rsync -r --no-times --delete --exclude='.git' --exclude='node_modules' --exclude='.trash' --exclude='*.pyc' --exclude='__pycache__' /root/clawd/ ${userR2Path}/workspace/ && date -Iseconds > ${userR2Path}/.last-sync`;
   
   try {
     const proc = await sandbox.startProcess(syncCmd);

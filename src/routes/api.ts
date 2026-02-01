@@ -621,13 +621,17 @@ function isCacheFresh(cachedMtime: string | null, ttlSeconds: number = FILE_CACH
 }
 
 /**
- * Read file from R2 cache
- * Returns null if not cached or stale
+ * Read file from R2 storage (source of truth)
+ * Returns null if file doesn't exist in R2
+ * 
+ * Note: R2 is now the primary storage, not just a cache.
+ * Files are synced from container to R2 periodically.
  */
 async function readFileFromR2(
   bucket: R2Bucket | undefined,
   userId: string,
-  filePath: string
+  filePath: string,
+  checkFreshness: boolean = false  // Set true for cache behavior, false for source-of-truth
 ): Promise<{ content: string; size: number; modified: string; source: 'r2' } | null> {
   if (!bucket) return null;
   
@@ -637,18 +641,20 @@ async function readFileFromR2(
     
     if (!obj) return null;
     
-    // Check freshness via custom metadata
-    const cachedAt = obj.customMetadata?.cachedAt;
-    if (!isCacheFresh(cachedAt)) {
-      console.log(`[files] R2 cache stale for ${filePath}`);
-      return null;
+    // Only check freshness if explicitly requested (cache mode)
+    if (checkFreshness) {
+      const cachedAt = obj.customMetadata?.cachedAt;
+      if (!isCacheFresh(cachedAt)) {
+        console.log(`[files] R2 stale for ${filePath}`);
+        return null;
+      }
     }
     
     const content = await obj.text();
-    const size = parseInt(obj.customMetadata?.size || '0', 10);
-    const modified = obj.customMetadata?.modified || new Date().toISOString();
+    const size = obj.size || parseInt(obj.customMetadata?.size || '0', 10);
+    const modified = obj.customMetadata?.modified || obj.uploaded?.toISOString() || new Date().toISOString();
     
-    console.log(`[files] R2 cache hit for ${filePath}`);
+    console.log(`[files] R2 hit for ${filePath}`);
     return { content, size, modified, source: 'r2' };
   } catch (err) {
     console.warn(`[files] R2 read error for ${filePath}:`, err);
@@ -977,15 +983,18 @@ api.get('/files/list', async (c) => {
 /**
  * GET /api/files/read - Read file contents
  * 
- * Fast path: Check R2 cache first
- * Slow path: Read from container, cache in R2
+ * R2-FIRST ARCHITECTURE:
+ * - Primary: Read from R2 (instant, ~50ms)
+ * - Fallback: Read from container (only if R2 miss, then cache)
+ * 
+ * R2 is the source of truth. Container syncs to R2 every 30s.
  */
 api.get('/files/read', async (c) => {
   const sandbox = c.get('sandbox');
   const userId = c.get('userId') as string | undefined;
   const path = c.req.query('path');
   const encoding = c.req.query('encoding') || 'utf-8';
-  const skipCache = c.req.query('fresh') === 'true';
+  const forceContainer = c.req.query('fresh') === 'true';
   
   if (!path) return c.json({ error: 'Path required' }, 400);
   
@@ -994,19 +1003,20 @@ api.get('/files/read', async (c) => {
   
   const bucket = c.env.MOLTBOT_BUCKET;
   
-  // === FAST PATH: Check R2 cache ===
-  if (!skipCache && userId && encoding !== 'base64') {
-    const cached = await readFileFromR2(bucket, userId, normalized);
-    if (cached) {
+  // === PRIMARY: Read from R2 (source of truth) ===
+  if (!forceContainer && userId && encoding !== 'base64') {
+    const r2File = await readFileFromR2(bucket, userId, normalized, false);  // false = don't check TTL
+    if (r2File) {
       return c.json({
         path: normalized,
-        content: cached.content,
-        size: cached.size,
-        modified: cached.modified,
+        content: r2File.content,
+        size: r2File.size,
+        modified: r2File.modified,
         encoding,
         source: 'r2',
       });
     }
+    console.log(`[files] R2 miss for ${normalized}, falling back to container`);
   }
   
   // === SLOW PATH: Read from container ===
@@ -1067,7 +1077,11 @@ api.get('/files/read', async (c) => {
 /**
  * POST /api/files/write - Write file contents
  * 
- * Write-through: Writes to both container and R2 cache
+ * R2-FIRST ARCHITECTURE:
+ * - Primary: Write to R2 immediately (fast response)
+ * - Background: Sync to container (for AI to read)
+ * 
+ * Container will pick up changes within seconds via background sync.
  */
 api.post('/files/write', async (c) => {
   const sandbox = c.get('sandbox');
@@ -1103,8 +1117,48 @@ api.post('/files/write', async (c) => {
     }, 413);
   }
   
+  const modified = new Date().toISOString();
+  
+  // === PRIMARY: Write to R2 first (instant) ===
+  if (userId && encoding !== 'base64') {
+    const success = await writeFileToR2(bucket, userId, normalized, content, contentSize, modified);
+    if (!success) {
+      return c.json({ error: 'Failed to write to storage' }, 500);
+    }
+    
+    // Invalidate directory cache
+    c.executionCtx.waitUntil(invalidateDirCache(bucket, userId, normalized));
+    
+    // Sync to container in background (for AI to read)
+    c.executionCtx.waitUntil((async () => {
+      try {
+        if (createDirs) {
+          const dir = normalized.substring(0, normalized.lastIndexOf('/'));
+          if (dir) {
+            const mkdirProc = await sandbox.startProcess(`mkdir -p "${dir}"`);
+            await waitForProcess(mkdirProc, 5000);
+          }
+        }
+        const escapedContent = content.replace(/'/g, "'\"'\"'");
+        const proc = await sandbox.startProcess(`printf '%s' '${escapedContent}' > "${normalized}"`);
+        await waitForProcess(proc, 30000);
+        console.log(`[files] Synced to container: ${normalized}`);
+      } catch (err) {
+        console.warn(`[files] Failed to sync to container: ${normalized}`, err);
+      }
+    })());
+    
+    return c.json({
+      success: true,
+      path: normalized,
+      size: contentSize,
+      modified,
+      source: 'r2',
+    });
+  }
+  
+  // === FALLBACK: Write to container directly (for binary files or no userId) ===
   try {
-    // Create parent directories if needed
     if (createDirs) {
       const dir = normalized.substring(0, normalized.lastIndexOf('/'));
       if (dir) {
@@ -1113,41 +1167,28 @@ api.post('/files/write', async (c) => {
       }
     }
     
-    // Write file to container
     if (encoding === 'base64') {
-      // Write binary via base64 decode
       const proc = await sandbox.startProcess(`echo "${content}" | base64 -d > "${normalized}"`);
       await waitForProcess(proc, 30000);
     } else {
-      // Write text using a temp file to handle special characters safely
       const escapedContent = content.replace(/'/g, "'\"'\"'");
       const proc = await sandbox.startProcess(`printf '%s' '${escapedContent}' > "${normalized}"`);
       await waitForProcess(proc, 30000);
     }
     
-    // Get new file stats
     const statProc = await sandbox.startProcess(`stat -c "%s|%Y" "${normalized}"`);
     await waitForProcess(statProc, 5000);
     const statLogs = await statProc.getLogs();
     const [sizeStr, mtimeStr] = (statLogs.stdout?.trim() || '0|0').split('|');
     const size = parseInt(sizeStr);
-    const modified = new Date(parseInt(mtimeStr) * 1000).toISOString();
-    
-    // Write-through to R2 cache + invalidate directory cache (don't await)
-    if (userId) {
-      c.executionCtx.waitUntil(
-        Promise.all([
-          encoding !== 'base64' ? writeFileToR2(bucket, userId, normalized, content, size, modified) : Promise.resolve(),
-          invalidateDirCache(bucket, userId, normalized),
-        ])
-      );
-    }
+    const modifiedFromStat = new Date(parseInt(mtimeStr) * 1000).toISOString();
     
     return c.json({
       success: true,
       path: normalized,
       size,
-      modified,
+      modified: modifiedFromStat,
+      source: 'container',
     });
   } catch (err) {
     console.error('File write error:', err);
