@@ -706,6 +706,106 @@ async function deleteFileFromR2(
   }
 }
 
+// Directory listing cache (shorter TTL since dirs change more often)
+const DIR_CACHE_TTL_SECONDS = 30;
+
+interface FileListItem {
+  name: string;
+  path: string;
+  type: 'file' | 'directory';
+  size: number;
+  modified: string;
+  extension?: string;
+}
+
+/**
+ * Get R2 key for directory listing cache
+ */
+function getDirR2Key(userId: string, dirPath: string): string {
+  const relativePath = dirPath.replace(/^\/root\/clawd\/?/, '') || '_root';
+  return `users/${userId}/dir-cache/${relativePath}.json`;
+}
+
+/**
+ * Read directory listing from R2 cache
+ */
+async function readDirFromR2(
+  bucket: R2Bucket | undefined,
+  userId: string,
+  dirPath: string
+): Promise<{ files: FileListItem[]; parent: string | null } | null> {
+  if (!bucket) return null;
+  
+  try {
+    const r2Key = getDirR2Key(userId, dirPath);
+    const obj = await bucket.get(r2Key);
+    
+    if (!obj) return null;
+    
+    const cachedAt = obj.customMetadata?.cachedAt;
+    if (!isCacheFresh(cachedAt, DIR_CACHE_TTL_SECONDS)) {
+      console.log(`[files] Dir cache stale for ${dirPath}`);
+      return null;
+    }
+    
+    const data = JSON.parse(await obj.text());
+    console.log(`[files] Dir cache hit for ${dirPath}`);
+    return data;
+  } catch (err) {
+    console.warn(`[files] Dir cache read error:`, err);
+    return null;
+  }
+}
+
+/**
+ * Write directory listing to R2 cache
+ */
+async function writeDirToR2(
+  bucket: R2Bucket | undefined,
+  userId: string,
+  dirPath: string,
+  files: FileListItem[],
+  parent: string | null
+): Promise<boolean> {
+  if (!bucket) return false;
+  
+  try {
+    const r2Key = getDirR2Key(userId, dirPath);
+    await bucket.put(r2Key, JSON.stringify({ files, parent }), {
+      customMetadata: {
+        cachedAt: Math.floor(Date.now() / 1000).toString(),
+      },
+    });
+    console.log(`[files] Dir cached to R2: ${dirPath}`);
+    return true;
+  } catch (err) {
+    console.warn(`[files] Dir cache write error:`, err);
+    return false;
+  }
+}
+
+/**
+ * Invalidate directory cache for a path and its parent
+ */
+async function invalidateDirCache(
+  bucket: R2Bucket | undefined,
+  userId: string,
+  filePath: string
+): Promise<void> {
+  if (!bucket) return;
+  
+  // Invalidate the directory containing the file
+  const dirPath = filePath.substring(0, filePath.lastIndexOf('/')) || WORKSPACE_ROOT;
+  const dirKey = getDirR2Key(userId, dirPath);
+  
+  try {
+    await bucket.delete(dirKey);
+    console.log(`[files] Dir cache invalidated: ${dirPath}`);
+  } catch {
+    // Ignore errors
+  }
+}
+
 /**
  * Validate that a path is within the workspace and safe to access
  */
@@ -733,14 +833,36 @@ function validateFilePath(path: string): { valid: boolean; normalized: string; e
 
 /**
  * GET /api/files/list - List directory contents
+ * 
+ * Fast path: Check R2 cache first (30s TTL)
+ * Slow path: Read from container, cache in R2
  */
 api.get('/files/list', async (c) => {
   const sandbox = c.get('sandbox');
+  const userId = c.get('userId') as string | undefined;
+  const bucket = c.env.MOLTBOT_BUCKET;
   const path = c.req.query('path') || WORKSPACE_ROOT;
+  const skipCache = c.req.query('fresh') === 'true';
   
   const { valid, normalized, error } = validateFilePath(path);
   if (!valid) return c.json({ error }, 400);
   
+  const parent = normalized === WORKSPACE_ROOT ? null : normalized.substring(0, normalized.lastIndexOf('/')) || '/';
+  
+  // === FAST PATH: Check R2 cache ===
+  if (!skipCache && userId) {
+    const cached = await readDirFromR2(bucket, userId, normalized);
+    if (cached) {
+      return c.json({
+        path: normalized,
+        files: cached.files,
+        parent: cached.parent,
+        source: 'r2',
+      });
+    }
+  }
+  
+  // === SLOW PATH: Read from container ===
   try {
     // Use find command to get file info: type|size|mtime|name
     const cmd = `find "${normalized}" -maxdepth 1 -printf "%y|%s|%T@|%f\\n" 2>/dev/null | tail -n +2 | head -500`;
@@ -748,13 +870,13 @@ api.get('/files/list', async (c) => {
     await waitForProcess(proc, 15000);
     const logs = await proc.getLogs();
     
-    const files = (logs.stdout?.split('\n').filter(Boolean) || []).map(line => {
+    const files: FileListItem[] = (logs.stdout?.split('\n').filter(Boolean) || []).map(line => {
       const [type, size, mtime, name] = line.split('|');
       const filePath = normalized === '/' ? `/${name}` : `${normalized}/${name}`;
       return {
         name,
         path: filePath,
-        type: type === 'd' ? 'directory' : 'file',
+        type: (type === 'd' ? 'directory' : 'file') as 'file' | 'directory',
         size: parseInt(size) || 0,
         modified: new Date(parseFloat(mtime) * 1000).toISOString(),
         extension: type !== 'd' ? (name.split('.').pop() || '') : undefined,
@@ -768,10 +890,16 @@ api.get('/files/list', async (c) => {
       return a.name.localeCompare(b.name);
     });
     
+    // Cache in R2 (don't await)
+    if (userId) {
+      c.executionCtx.waitUntil(writeDirToR2(bucket, userId, normalized, files, parent));
+    }
+    
     return c.json({ 
       path: normalized, 
       files,
-      parent: normalized === WORKSPACE_ROOT ? null : normalized.substring(0, normalized.lastIndexOf('/')) || '/',
+      parent,
+      source: 'container',
     });
   } catch (err) {
     console.error('File list error:', err);
@@ -938,10 +1066,13 @@ api.post('/files/write', async (c) => {
     const size = parseInt(sizeStr);
     const modified = new Date(parseInt(mtimeStr) * 1000).toISOString();
     
-    // Write-through to R2 cache (don't await - fire and forget)
-    if (userId && encoding !== 'base64') {
+    // Write-through to R2 cache + invalidate directory cache (don't await)
+    if (userId) {
       c.executionCtx.waitUntil(
-        writeFileToR2(bucket, userId, normalized, content, size, modified)
+        Promise.all([
+          encoding !== 'base64' ? writeFileToR2(bucket, userId, normalized, content, size, modified) : Promise.resolve(),
+          invalidateDirCache(bucket, userId, normalized),
+        ])
       );
     }
     
@@ -1138,9 +1269,14 @@ api.delete('/files', async (c) => {
       return c.json({ error: 'Path not found' }, 404);
     }
     
-    // Clear from R2 cache (don't await)
+    // Clear from R2 cache + invalidate directory cache (don't await)
     if (userId) {
-      c.executionCtx.waitUntil(deleteFileFromR2(bucket, userId, normalized));
+      c.executionCtx.waitUntil(
+        Promise.all([
+          deleteFileFromR2(bucket, userId, normalized),
+          invalidateDirCache(bucket, userId, normalized),
+        ])
+      );
     }
     
     if (permanent) {
@@ -1181,6 +1317,8 @@ api.delete('/files', async (c) => {
  */
 api.post('/files/mkdir', async (c) => {
   const sandbox = c.get('sandbox');
+  const userId = c.get('userId') as string | undefined;
+  const bucket = c.env.MOLTBOT_BUCKET;
   
   let body;
   try {
@@ -1200,6 +1338,11 @@ api.post('/files/mkdir', async (c) => {
     const proc = await sandbox.startProcess(`mkdir -p "${normalized}"`);
     await waitForProcess(proc, 10000);
     
+    // Invalidate parent directory cache
+    if (userId) {
+      c.executionCtx.waitUntil(invalidateDirCache(bucket, userId, normalized));
+    }
+    
     return c.json({ success: true, path: normalized });
   } catch (err) {
     console.error('Mkdir error:', err);
@@ -1212,6 +1355,8 @@ api.post('/files/mkdir', async (c) => {
  */
 api.post('/files/move', async (c) => {
   const sandbox = c.get('sandbox');
+  const userId = c.get('userId') as string | undefined;
+  const bucket = c.env.MOLTBOT_BUCKET;
   
   let body;
   try {
@@ -1250,6 +1395,17 @@ api.post('/files/move', async (c) => {
     // Move file
     const mvProc = await sandbox.startProcess(`mv "${fromValidation.normalized}" "${toValidation.normalized}"`);
     await waitForProcess(mvProc, 10000);
+    
+    // Invalidate caches for both source and destination directories
+    if (userId) {
+      c.executionCtx.waitUntil(
+        Promise.all([
+          deleteFileFromR2(bucket, userId, fromValidation.normalized),
+          invalidateDirCache(bucket, userId, fromValidation.normalized),
+          invalidateDirCache(bucket, userId, toValidation.normalized),
+        ])
+      );
+    }
     
     return c.json({
       success: true,
