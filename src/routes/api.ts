@@ -292,8 +292,41 @@ api.options('/history', (c) => {
 });
 
 /**
- * GET /api/history - Get chat history directly from JSONL file
- * Workaround for chat.history returning empty
+ * Parse JSONL content into messages array
+ */
+function parseJSONLHistory(content: string): Array<{ role: string; content: unknown; timestamp?: number }> {
+  const messages: Array<{ role: string; content: unknown; timestamp?: number }> = [];
+  const lines = content.split(/\r?\n/);
+  
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line);
+      // Handle both formats: { message: {...} } and direct { role, content }
+      const msg = parsed.message || parsed;
+      if (msg && (msg.role === 'user' || msg.role === 'assistant')) {
+        messages.push({
+          role: msg.role,
+          content: msg.content,
+          timestamp: parsed.timestamp || msg.timestamp,
+        });
+      }
+    } catch {
+      // Skip invalid JSON lines
+    }
+  }
+  
+  return messages;
+}
+
+/**
+ * GET /api/history - Get chat history
+ * 
+ * Fast path: Read directly from R2 (no container boot needed)
+ * Slow path: Fall back to container if R2 read fails
+ * 
+ * R2 data is synced every 5 minutes, so it may be slightly stale.
+ * For fresh history during active session, WebSocket provides real-time updates.
  */
 api.get('/history', async (c) => {
   // Add CORS headers for cross-origin requests from automna.ai
@@ -301,8 +334,51 @@ api.get('/history', async (c) => {
   c.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
   c.header('Access-Control-Allow-Headers', 'Content-Type');
   
-  const sandbox = c.get('sandbox');
+  const userId = c.get('userId');
   const sessionKey = c.req.query('sessionKey') || 'main';
+  
+  if (!userId) {
+    return c.json({ error: 'Not authenticated' }, 401);
+  }
+
+  // === FAST PATH: Read directly from R2 ===
+  try {
+    const bucket = c.env.MOLTBOT_BUCKET;
+    if (bucket) {
+      // First, read sessions.json to find the session file path
+      const sessionsKey = `users/${userId}/clawdbot/agents/main/sessions/sessions.json`;
+      const sessionsObj = await bucket.get(sessionsKey);
+      
+      if (sessionsObj) {
+        const sessionsData = JSON.parse(await sessionsObj.text());
+        const sessionEntry = sessionsData[sessionKey];
+        
+        if (sessionEntry?.sessionFile) {
+          // Extract the relative path from the session file
+          // sessionFile is like "/root/.clawdbot/agents/main/sessions/main/history.jsonl"
+          // We need "agents/main/sessions/main/history.jsonl"
+          const relativePath = sessionEntry.sessionFile.replace(/^\/root\/\.clawdbot\//, '');
+          const historyKey = `users/${userId}/clawdbot/${relativePath}`;
+          
+          const historyObj = await bucket.get(historyKey);
+          if (historyObj) {
+            const content = await historyObj.text();
+            const messages = parseJSONLHistory(content);
+            console.log(`[history] R2 fast path: ${messages.length} messages for ${sessionKey}`);
+            return c.json({ sessionKey, messages, source: 'r2' });
+          }
+        }
+      }
+      
+      // Session not found in R2 - might be new user or not synced yet
+      console.log(`[history] R2 miss for user ${userId}, session ${sessionKey}`);
+    }
+  } catch (err) {
+    console.warn('[history] R2 read failed, falling back to container:', err);
+  }
+
+  // === SLOW PATH: Fall back to container ===
+  const sandbox = c.get('sandbox');
   
   try {
     // Ensure gateway is running
@@ -333,12 +409,13 @@ api.get('/history', async (c) => {
         if (!line.trim()) continue;
         try {
           const parsed = JSON.parse(line);
-          if (parsed.message && (parsed.message.role === 'user' || parsed.message.role === 'assistant')) {
-            messages.push(parsed.message);
+          const msg = parsed.message || parsed;
+          if (msg && (msg.role === 'user' || msg.role === 'assistant')) {
+            messages.push({ role: msg.role, content: msg.content, timestamp: parsed.timestamp || msg.timestamp });
           }
         } catch {}
       }
-      console.log(JSON.stringify({ sessionKey: '${sessionKey}', messages }));
+      console.log(JSON.stringify({ sessionKey: '${sessionKey}', messages, source: 'container' }));
     `;
     
     const proc = await sandbox.startProcess(
