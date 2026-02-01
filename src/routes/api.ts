@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import type { Sandbox } from '@cloudflare/sandbox';
 import type { AppEnv } from '../types';
 import { createAccessMiddleware } from '../auth';
 import { ensureMoltbotGateway, findExistingMoltbotProcess, mountR2Storage, syncToR2, waitForProcess } from '../gateway';
@@ -806,6 +807,67 @@ async function invalidateDirCache(
   }
 }
 
+// Text file extensions worth pre-fetching
+const TEXT_EXTENSIONS = new Set(['md', 'txt', 'json', 'yaml', 'yml', 'js', 'ts', 'jsx', 'tsx', 'py', 'css', 'html', 'xml', 'toml', 'ini', 'env', 'sh']);
+const MAX_PREFETCH_SIZE = 100 * 1024;  // 100KB max per file
+const MAX_PREFETCH_FILES = 10;  // Max files to pre-fetch per directory
+
+/**
+ * Pre-fetch small text files from a directory listing and cache in R2.
+ * Called in background after directory listing to speed up file opens.
+ */
+async function preFetchSmallFiles(
+  sandbox: Sandbox,
+  bucket: R2Bucket | undefined,
+  userId: string,
+  files: FileListItem[]
+): Promise<void> {
+  if (!bucket) return;
+  
+  // Filter to small text files worth pre-fetching
+  const textFiles = files.filter(f => 
+    f.type === 'file' && 
+    f.size > 0 && 
+    f.size < MAX_PREFETCH_SIZE &&
+    f.extension && 
+    TEXT_EXTENSIONS.has(f.extension.toLowerCase())
+  ).slice(0, MAX_PREFETCH_FILES);
+  
+  if (textFiles.length === 0) return;
+  
+  console.log(`[files] Pre-fetching ${textFiles.length} text files`);
+  
+  // Build a single shell command to cat all files with delimiters
+  // Format: ===FILE:/path===\ncontent\n===END===
+  const paths = textFiles.map(f => f.path);
+  const catCmd = paths.map(p => `echo "===FILE:${p}===" && cat "${p}" && echo "===END==="`).join(' && ');
+  
+  try {
+    const proc = await sandbox.startProcess(catCmd);
+    await waitForProcess(proc, 30000);
+    const output = proc.getLogs ? (await proc.getLogs()).stdout || '' : '';
+    
+    // Parse the output and cache each file
+    const fileRegex = /===FILE:(.+?)===\n([\s\S]*?)===END===/g;
+    let match;
+    let cached = 0;
+    
+    while ((match = fileRegex.exec(output)) !== null) {
+      const [, filePath, content] = match;
+      const fileInfo = textFiles.find(f => f.path === filePath);
+      
+      if (fileInfo) {
+        await writeFileToR2(bucket, userId, filePath, content, fileInfo.size, fileInfo.modified);
+        cached++;
+      }
+    }
+    
+    console.log(`[files] Pre-cached ${cached}/${textFiles.length} files`);
+  } catch (err) {
+    console.warn('[files] Pre-fetch failed:', err);
+  }
+}
+
 /**
  * Validate that a path is within the workspace and safe to access
  */
@@ -890,9 +952,14 @@ api.get('/files/list', async (c) => {
       return a.name.localeCompare(b.name);
     });
     
-    // Cache in R2 (don't await)
+    // Cache in R2 + pre-fetch small text files (don't await)
     if (userId) {
-      c.executionCtx.waitUntil(writeDirToR2(bucket, userId, normalized, files, parent));
+      c.executionCtx.waitUntil(
+        Promise.all([
+          writeDirToR2(bucket, userId, normalized, files, parent),
+          preFetchSmallFiles(sandbox, bucket, userId, files),
+        ])
+      );
     }
     
     return c.json({ 
