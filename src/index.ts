@@ -199,6 +199,162 @@ app.route('/', publicRoutes);
 app.route('/cdp', cdp);
 
 // =============================================================================
+// HISTORY ENDPOINT: Accepts signed URL auth (before CF Access middleware)
+// =============================================================================
+// This endpoint needs to be before CF Access middleware because the webchat client
+// calls it with signed URL params, not CF Access JWT
+
+import { waitForProcess } from './gateway';
+
+app.get('/api/history', async (c) => {
+  const url = new URL(c.req.url);
+  
+  // Add CORS headers
+  c.header('Access-Control-Allow-Origin', 'https://automna.ai');
+  c.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  c.header('Access-Control-Allow-Headers', 'Content-Type');
+  
+  // Check for signed URL params
+  const userId = url.searchParams.get('userId');
+  const exp = url.searchParams.get('exp');
+  const sig = url.searchParams.get('sig');
+  
+  if (!userId || !exp || !sig) {
+    return c.json({ error: 'Missing auth params (userId, exp, sig)' }, 401);
+  }
+  
+  // Validate signature
+  if (c.env.MOLTBOT_SIGNING_SECRET) {
+    const validation = await validateSignedUrl(url, c.env.MOLTBOT_SIGNING_SECRET);
+    if (!validation.valid) {
+      return c.json({ error: 'Unauthorized', details: validation.error }, 401);
+    }
+  }
+  
+  // Get per-user sandbox
+  const options = buildSandboxOptions(c.env);
+  const sandboxId = `user-${userId}`.toLowerCase();
+  const sandbox = getSandbox(c.env.Sandbox, sandboxId, { ...options, normalizeId: true });
+  
+  const sessionKey = url.searchParams.get('sessionKey') || 'main';
+  
+  try {
+    // Ensure gateway is running
+    await ensureMoltbotGateway(sandbox, c.env, userId);
+    
+    // Read history from JSONL file
+    const script = `
+      const fs = require('fs');
+      const storePath = '/root/.clawdbot/agents/main/sessions/sessions.json';
+      if (!fs.existsSync(storePath)) {
+        console.log(JSON.stringify({ error: 'sessions.json not found' }));
+        process.exit(0);
+      }
+      const store = JSON.parse(fs.readFileSync(storePath, 'utf-8'));
+      const entry = store['${sessionKey}'];
+      if (!entry) {
+        console.log(JSON.stringify({ error: 'session not found', keys: Object.keys(store) }));
+        process.exit(0);
+      }
+      const sessionFile = entry.sessionFile;
+      if (!fs.existsSync(sessionFile)) {
+        console.log(JSON.stringify({ error: 'JSONL file not found', sessionFile }));
+        process.exit(0);
+      }
+      const lines = fs.readFileSync(sessionFile, 'utf-8').split(/\\r?\\n/);
+      const messages = [];
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed.message && (parsed.message.role === 'user' || parsed.message.role === 'assistant')) {
+            messages.push(parsed.message);
+          }
+        } catch {}
+      }
+      console.log(JSON.stringify({ sessionKey: '${sessionKey}', messages }));
+    `;
+    
+    const proc = await sandbox.startProcess('node -e ' + JSON.stringify(script.replace(/\n/g, ' ')));
+    await waitForProcess(proc, 10000);
+    
+    const logs = await proc.getLogs();
+    try {
+      return c.json(JSON.parse(logs.stdout || '{}'));
+    } catch {
+      return c.json({ error: 'Failed to parse output', stdout: logs.stdout, stderr: logs.stderr }, 500);
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// Alias for webchat client compatibility
+app.get('/ws/api/history', async (c) => {
+  // Forward to /api/history handler by reconstructing the URL
+  const url = new URL(c.req.url);
+  url.pathname = '/api/history';
+  const newReq = new Request(url.toString(), c.req.raw);
+  return app.fetch(newReq, c.env, c.executionCtx);
+});
+
+// =============================================================================
+// KEEP-ALIVE ENDPOINT: Prevents sandbox hibernation
+// =============================================================================
+// Dashboard pings this every 4 minutes to keep the container warm
+
+app.get('/api/keepalive', async (c) => {
+  const url = new URL(c.req.url);
+  
+  // Add CORS headers
+  c.header('Access-Control-Allow-Origin', 'https://automna.ai');
+  c.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  c.header('Access-Control-Allow-Headers', 'Content-Type');
+  
+  // Check for signed URL params
+  const userId = url.searchParams.get('userId');
+  const exp = url.searchParams.get('exp');
+  const sig = url.searchParams.get('sig');
+  
+  if (!userId || !exp || !sig) {
+    return c.json({ error: 'Missing auth params' }, 401);
+  }
+  
+  // Validate signature
+  if (c.env.MOLTBOT_SIGNING_SECRET) {
+    const validation = await validateSignedUrl(url, c.env.MOLTBOT_SIGNING_SECRET);
+    if (!validation.valid) {
+      return c.json({ error: 'Unauthorized', details: validation.error }, 401);
+    }
+  }
+  
+  // Get sandbox and ensure gateway is running (this keeps it warm)
+  const options = buildSandboxOptions(c.env);
+  const sandboxId = `user-${userId}`.toLowerCase();
+  const sandbox = getSandbox(c.env.Sandbox, sandboxId, { ...options, normalizeId: true });
+  
+  try {
+    await ensureMoltbotGateway(sandbox, c.env, userId);
+    return c.json({ 
+      status: 'alive', 
+      userId: userId,
+      timestamp: Date.now() 
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ status: 'error', error: errorMessage }, 500);
+  }
+});
+
+app.options('/api/keepalive', (c) => {
+  c.header('Access-Control-Allow-Origin', 'https://automna.ai');
+  c.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  c.header('Access-Control-Allow-Headers', 'Content-Type');
+  return c.text('', 204);
+});
+
+// =============================================================================
 // PROTECTED ROUTES: Cloudflare Access authentication required
 // =============================================================================
 
@@ -373,6 +529,31 @@ app.all('*', async (c) => {
     // Get gateway token for auth injection
     const gatewayToken = c.env.MOLTBOT_GATEWAY_TOKEN;
     
+    // Queue for messages received before container WS is ready
+    const pendingMessages: (string | ArrayBuffer)[] = [];
+    let containerReady = containerWs.readyState === WebSocket.OPEN;
+    
+    // Flush pending messages when container becomes ready
+    const flushPendingMessages = () => {
+      console.log('[WS] Flushing', pendingMessages.length, 'pending messages');
+      while (pendingMessages.length > 0 && containerWs.readyState === WebSocket.OPEN) {
+        const msg = pendingMessages.shift();
+        if (msg) containerWs.send(msg);
+      }
+      containerReady = true;
+    };
+    
+    // Listen for container WS open event
+    containerWs.addEventListener('open', () => {
+      console.log('[WS] Container WebSocket opened');
+      flushPendingMessages();
+    });
+    
+    // If already open, mark as ready
+    if (containerWs.readyState === WebSocket.OPEN) {
+      containerReady = true;
+    }
+    
     // Relay messages from client to container, injecting auth token on connect
     serverWs.addEventListener('message', (event) => {
       console.log('[WS] Client -> Container:', typeof event.data, typeof event.data === 'string' ? event.data.slice(0, 200) : '(binary)');
@@ -396,10 +577,11 @@ app.all('*', async (c) => {
         }
       }
       
-      if (containerWs.readyState === WebSocket.OPEN) {
+      if (containerReady && containerWs.readyState === WebSocket.OPEN) {
         containerWs.send(dataToSend);
       } else {
-        console.log('[WS] Container not open, readyState:', containerWs.readyState);
+        console.log('[WS] Container not ready, queueing message');
+        pendingMessages.push(dataToSend);
       }
     });
     
