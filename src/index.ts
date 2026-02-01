@@ -47,6 +47,61 @@ function transformErrorMessage(message: string, host: string): string {
   return message;
 }
 
+const WORKSPACE_ROOT = '/root/clawd';
+
+/**
+ * Pre-cache the workspace root directory listing in R2.
+ * Called during keepalive/prewarm so Files tab loads instantly.
+ */
+async function preCacheWorkspaceDir(
+  sandbox: Sandbox,
+  env: MoltbotEnv,
+  userId: string
+): Promise<void> {
+  const bucket = env.MOLTBOT_BUCKET;
+  if (!bucket) return;
+  
+  try {
+    // Get directory listing from container
+    const cmd = `find "${WORKSPACE_ROOT}" -maxdepth 1 -printf "%y|%s|%T@|%f\\n" 2>/dev/null | tail -n +2 | head -500`;
+    const proc = await sandbox.startProcess(cmd);
+    await waitForProcess(proc, 15000);
+    const logs = await proc.getLogs();
+    
+    const files = (logs.stdout?.split('\n').filter(Boolean) || []).map(line => {
+      const [type, size, mtime, name] = line.split('|');
+      const filePath = `${WORKSPACE_ROOT}/${name}`;
+      return {
+        name,
+        path: filePath,
+        type: type === 'd' ? 'directory' : 'file',
+        size: parseInt(size) || 0,
+        modified: new Date(parseFloat(mtime) * 1000).toISOString(),
+        extension: type !== 'd' ? (name.split('.').pop() || '') : undefined,
+      };
+    });
+    
+    // Sort: directories first, then alphabetically
+    files.sort((a, b) => {
+      if (a.type === 'directory' && b.type !== 'directory') return -1;
+      if (a.type !== 'directory' && b.type === 'directory') return 1;
+      return a.name.localeCompare(b.name);
+    });
+    
+    // Cache to R2
+    const r2Key = `users/${userId}/dir-cache/_root.json`;
+    await bucket.put(r2Key, JSON.stringify({ files, parent: null }), {
+      customMetadata: {
+        cachedAt: Math.floor(Date.now() / 1000).toString(),
+      },
+    });
+    
+    console.log(`[prewarm] Pre-cached workspace dir: ${files.length} items`);
+  } catch (err) {
+    console.warn('[prewarm] Failed to pre-cache workspace dir:', err);
+  }
+}
+
 export { Sandbox };
 
 /**
@@ -591,16 +646,21 @@ app.get('/api/keepalive', async (c) => {
   try {
     await ensureMoltbotGateway(sandbox, c.env, userId);
     
-    // Trigger R2 sync in background (keeps data fresh for fast history loads)
+    // Trigger R2 sync + workspace pre-cache in background
     c.executionCtx.waitUntil(
-      syncToR2(sandbox, c.env, { userId }).then(syncResult => {
-        if (syncResult.success) {
-          console.log(`[keepalive] R2 sync completed for user ${userId}`);
-        } else {
-          console.warn(`[keepalive] R2 sync failed: ${syncResult.error}`);
-        }
-      }).catch(err => {
-        console.warn(`[keepalive] R2 sync error:`, err);
+      Promise.all([
+        // Sync chat history to R2
+        syncToR2(sandbox, c.env, { userId }).then(syncResult => {
+          if (syncResult.success) {
+            console.log(`[keepalive] R2 sync completed for user ${userId}`);
+          } else {
+            console.warn(`[keepalive] R2 sync failed: ${syncResult.error}`);
+          }
+        }),
+        // Pre-cache workspace root directory listing
+        preCacheWorkspaceDir(sandbox, c.env, userId),
+      ]).catch(err => {
+        console.warn(`[keepalive] Background task error:`, err);
       })
     );
     
@@ -608,7 +668,8 @@ app.get('/api/keepalive', async (c) => {
       status: 'alive', 
       userId: userId,
       timestamp: Date.now(),
-      syncing: true  // Indicates R2 sync was triggered
+      syncing: true,
+      preCaching: true,
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
