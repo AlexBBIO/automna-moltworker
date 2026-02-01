@@ -49,8 +49,19 @@ function transformErrorMessage(message: string, host: string): string {
 
 const WORKSPACE_ROOT = '/root/clawd';
 
+// Key files to pre-cache during prewarm (these are commonly opened)
+const KEY_FILES = [
+  'SOUL.md',
+  'AGENTS.md', 
+  'USER.md',
+  'IDENTITY.md',
+  'TOOLS.md',
+  'MEMORY.md',
+  'HEARTBEAT.md',
+];
+
 /**
- * Pre-cache the workspace root directory listing in R2.
+ * Pre-cache the workspace root directory listing AND key files in R2.
  * Called during keepalive/prewarm so Files tab loads instantly.
  */
 async function preCacheWorkspaceDir(
@@ -88,7 +99,7 @@ async function preCacheWorkspaceDir(
       return a.name.localeCompare(b.name);
     });
     
-    // Cache to R2
+    // Cache directory listing to R2
     const r2Key = `users/${userId}/dir-cache/_root.json`;
     await bucket.put(r2Key, JSON.stringify({ files, parent: null }), {
       customMetadata: {
@@ -97,8 +108,60 @@ async function preCacheWorkspaceDir(
     });
     
     console.log(`[prewarm] Pre-cached workspace dir: ${files.length} items`);
+    
+    // Also pre-cache key files content
+    const keyFilesExist = files.filter(f => f.type === 'file' && KEY_FILES.includes(f.name));
+    if (keyFilesExist.length > 0) {
+      await preCacheKeyFiles(sandbox, bucket, userId, keyFilesExist);
+    }
   } catch (err) {
     console.warn('[prewarm] Failed to pre-cache workspace dir:', err);
+  }
+}
+
+/**
+ * Pre-cache content of key workspace files
+ */
+async function preCacheKeyFiles(
+  sandbox: Sandbox,
+  bucket: R2Bucket,
+  userId: string,
+  files: Array<{ name: string; path: string; size: number; modified: string }>
+): Promise<void> {
+  try {
+    // Batch cat all key files with delimiters
+    const paths = files.map(f => f.path);
+    const catCmd = paths.map(p => `echo "===FILE:${p}===" && cat "${p}" 2>/dev/null && echo "===END==="`).join(' ; ');
+    
+    const proc = await sandbox.startProcess(catCmd);
+    await waitForProcess(proc, 30000);
+    const output = (await proc.getLogs()).stdout || '';
+    
+    // Parse and cache each file
+    const fileRegex = /===FILE:(.+?)===\n([\s\S]*?)===END===/g;
+    let match;
+    let cached = 0;
+    
+    while ((match = fileRegex.exec(output)) !== null) {
+      const [, filePath, content] = match;
+      const fileInfo = files.find(f => f.path === filePath);
+      
+      if (fileInfo) {
+        const r2Key = `users/${userId}/workspace/${fileInfo.name}`;
+        await bucket.put(r2Key, content, {
+          customMetadata: {
+            size: fileInfo.size.toString(),
+            modified: fileInfo.modified,
+            cachedAt: Math.floor(Date.now() / 1000).toString(),
+          },
+        });
+        cached++;
+      }
+    }
+    
+    console.log(`[prewarm] Pre-cached ${cached} key files`);
+  } catch (err) {
+    console.warn('[prewarm] Failed to pre-cache key files:', err);
   }
 }
 
