@@ -998,6 +998,15 @@ app.all('*', async (c) => {
     console.log('[WS] containerWs.readyState:', containerWs.readyState);
     console.log('[WS] serverWs.readyState:', serverWs.readyState);
     
+    // Pre-cache workspace directory in background (for fast Files tab loading)
+    if (userId) {
+      c.executionCtx.waitUntil(
+        preCacheWorkspaceDir(sandbox, c.env, userId).catch(err => {
+          console.warn('[WS] Background workspace prewarm failed:', err);
+        })
+      );
+    }
+    
     // Get gateway token for auth injection
     const gatewayToken = c.env.MOLTBOT_GATEWAY_TOKEN;
     

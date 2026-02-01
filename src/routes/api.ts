@@ -599,7 +599,7 @@ api.post('/reset-workspace', async (c) => {
 const WORKSPACE_ROOT = '/root/clawd';
 const MAX_FILE_SIZE = 10 * 1024 * 1024;  // 10MB
 const MAX_UPLOAD_SIZE = 50 * 1024 * 1024;  // 50MB
-const FILE_CACHE_TTL_SECONDS = 60;  // Cache files for 60 seconds
+const FILE_CACHE_TTL_SECONDS = 300;  // Cache files for 5 minutes (invalidated on write)
 
 /**
  * Get R2 key for a file path
@@ -713,8 +713,8 @@ async function deleteFileFromR2(
   }
 }
 
-// Directory listing cache (shorter TTL since dirs change more often)
-const DIR_CACHE_TTL_SECONDS = 30;
+// Directory listing cache (5 minutes, invalidated on file write/delete/mkdir)
+const DIR_CACHE_TTL_SECONDS = 300;
 
 interface FileListItem {
   name: string;
