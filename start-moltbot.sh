@@ -336,9 +336,10 @@ rm -f "$CONFIG_DIR/gateway.lock" 2>/dev/null || true
 
 BIND_MODE="lan"
 echo "Dev mode: ${CLAWDBOT_DEV_MODE:-false}, Bind mode: $BIND_MODE"
+echo "Token present: $([ -n "$CLAWDBOT_GATEWAY_TOKEN" ] && echo "YES (${#CLAWDBOT_GATEWAY_TOKEN} chars)" || echo "NO")"
 
 if [ -n "$CLAWDBOT_GATEWAY_TOKEN" ]; then
-    echo "Starting gateway with token auth..."
+    echo "Starting gateway with token auth (token length: ${#CLAWDBOT_GATEWAY_TOKEN})..."
     exec clawdbot gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE" --token "$CLAWDBOT_GATEWAY_TOKEN"
 else
     echo "Starting gateway with device pairing (no token)..."
@@ -348,3 +349,4 @@ fi
 # Rebuild: 1769729813
 # Rebuild: 1769730234
 # Rebuild: 1769731314
+# Rebuild: 1769904300
