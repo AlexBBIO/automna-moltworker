@@ -598,6 +598,113 @@ api.post('/reset-workspace', async (c) => {
 const WORKSPACE_ROOT = '/root/clawd';
 const MAX_FILE_SIZE = 10 * 1024 * 1024;  // 10MB
 const MAX_UPLOAD_SIZE = 50 * 1024 * 1024;  // 50MB
+const FILE_CACHE_TTL_SECONDS = 60;  // Cache files for 60 seconds
+
+/**
+ * Get R2 key for a file path
+ * Converts /root/clawd/foo/bar.md → users/{userId}/workspace/foo/bar.md
+ */
+function getFileR2Key(userId: string, filePath: string): string {
+  const relativePath = filePath.replace(/^\/root\/clawd\/?/, '');
+  return `users/${userId}/workspace/${relativePath}`;
+}
+
+/**
+ * Check if cached file is still fresh based on stored mtime
+ */
+function isCacheFresh(cachedMtime: string | null, ttlSeconds: number = FILE_CACHE_TTL_SECONDS): boolean {
+  if (!cachedMtime) return false;
+  const cachedTime = parseInt(cachedMtime, 10);
+  const now = Math.floor(Date.now() / 1000);
+  return (now - cachedTime) < ttlSeconds;
+}
+
+/**
+ * Read file from R2 cache
+ * Returns null if not cached or stale
+ */
+async function readFileFromR2(
+  bucket: R2Bucket | undefined,
+  userId: string,
+  filePath: string
+): Promise<{ content: string; size: number; modified: string; source: 'r2' } | null> {
+  if (!bucket) return null;
+  
+  try {
+    const r2Key = getFileR2Key(userId, filePath);
+    const obj = await bucket.get(r2Key);
+    
+    if (!obj) return null;
+    
+    // Check freshness via custom metadata
+    const cachedAt = obj.customMetadata?.cachedAt;
+    if (!isCacheFresh(cachedAt)) {
+      console.log(`[files] R2 cache stale for ${filePath}`);
+      return null;
+    }
+    
+    const content = await obj.text();
+    const size = parseInt(obj.customMetadata?.size || '0', 10);
+    const modified = obj.customMetadata?.modified || new Date().toISOString();
+    
+    console.log(`[files] R2 cache hit for ${filePath}`);
+    return { content, size, modified, source: 'r2' };
+  } catch (err) {
+    console.warn(`[files] R2 read error for ${filePath}:`, err);
+    return null;
+  }
+}
+
+/**
+ * Write file to R2 cache
+ */
+async function writeFileToR2(
+  bucket: R2Bucket | undefined,
+  userId: string,
+  filePath: string,
+  content: string,
+  size: number,
+  modified: string
+): Promise<boolean> {
+  if (!bucket) return false;
+  
+  try {
+    const r2Key = getFileR2Key(userId, filePath);
+    await bucket.put(r2Key, content, {
+      customMetadata: {
+        size: size.toString(),
+        modified,
+        cachedAt: Math.floor(Date.now() / 1000).toString(),
+      },
+    });
+    console.log(`[files] Cached to R2: ${filePath}`);
+    return true;
+  } catch (err) {
+    console.warn(`[files] R2 write error for ${filePath}:`, err);
+    return false;
+  }
+}
+
+/**
+ * Delete file from R2 cache
+ */
+async function deleteFileFromR2(
+  bucket: R2Bucket | undefined,
+  userId: string,
+  filePath: string
+): Promise<boolean> {
+  if (!bucket) return false;
+  
+  try {
+    const r2Key = getFileR2Key(userId, filePath);
+    await bucket.delete(r2Key);
+    console.log(`[files] Deleted from R2: ${filePath}`);
+    return true;
+  } catch (err) {
+    console.warn(`[files] R2 delete error for ${filePath}:`, err);
+    return false;
+  }
+}
 
 /**
  * Validate that a path is within the workspace and safe to access
@@ -674,30 +781,63 @@ api.get('/files/list', async (c) => {
 
 /**
  * GET /api/files/read - Read file contents
+ * 
+ * Fast path: Check R2 cache first
+ * Slow path: Read from container, cache in R2
  */
 api.get('/files/read', async (c) => {
   const sandbox = c.get('sandbox');
+  const userId = c.get('userId') as string | undefined;
   const path = c.req.query('path');
   const encoding = c.req.query('encoding') || 'utf-8';
+  const skipCache = c.req.query('fresh') === 'true';
   
   if (!path) return c.json({ error: 'Path required' }, 400);
   
   const { valid, normalized, error } = validateFilePath(path);
   if (!valid) return c.json({ error }, 400);
   
+  const bucket = c.env.MOLTBOT_BUCKET;
+  
+  // === FAST PATH: Check R2 cache ===
+  if (!skipCache && userId && encoding !== 'base64') {
+    const cached = await readFileFromR2(bucket, userId, normalized);
+    if (cached) {
+      return c.json({
+        path: normalized,
+        content: cached.content,
+        size: cached.size,
+        modified: cached.modified,
+        encoding,
+        source: 'r2',
+      });
+    }
+  }
+  
+  // === SLOW PATH: Read from container ===
   try {
-    // Check file exists and get size
-    const statProc = await sandbox.startProcess(`stat -c "%s|%Y" "${normalized}" 2>/dev/null || echo "NOT_FOUND"`);
-    await waitForProcess(statProc, 5000);
-    const statLogs = await statProc.getLogs();
-    const statOutput = statLogs.stdout?.trim() || '';
+    // Combine stat + cat into single command for speed
+    const cmd = encoding === 'base64'
+      ? `stat -c "%s|%Y" "${normalized}" 2>/dev/null && base64 "${normalized}"`
+      : `stat -c "%s|%Y" "${normalized}" 2>/dev/null && cat "${normalized}"`;
     
-    if (statOutput === 'NOT_FOUND' || !statOutput) {
+    const proc = await sandbox.startProcess(cmd);
+    await waitForProcess(proc, 30000);
+    const logs = await proc.getLogs();
+    const output = logs.stdout || '';
+    
+    // First line is stat output, rest is file content
+    const firstNewline = output.indexOf('\n');
+    if (firstNewline === -1 || output.startsWith('NOT_FOUND')) {
       return c.json({ error: 'File not found' }, 404);
     }
     
-    const [sizeStr, mtimeStr] = statOutput.split('|');
+    const statLine = output.substring(0, firstNewline);
+    const content = output.substring(firstNewline + 1);
+    
+    const [sizeStr, mtimeStr] = statLine.split('|');
     const size = parseInt(sizeStr) || 0;
+    const modified = new Date(parseInt(mtimeStr) * 1000).toISOString();
     
     if (size > MAX_FILE_SIZE) {
       return c.json({ 
@@ -708,20 +848,20 @@ api.get('/files/read', async (c) => {
       }, 413);
     }
     
-    // Read file content
-    const readCmd = encoding === 'base64' 
-      ? `base64 "${normalized}"`
-      : `cat "${normalized}"`;
-    const proc = await sandbox.startProcess(readCmd);
-    await waitForProcess(proc, 30000);
-    const logs = await proc.getLogs();
+    // Cache in R2 for next time (don't await - fire and forget)
+    if (userId && encoding !== 'base64') {
+      c.executionCtx.waitUntil(
+        writeFileToR2(bucket, userId, normalized, content, size, modified)
+      );
+    }
     
     return c.json({
       path: normalized,
-      content: logs.stdout || '',
+      content,
       size,
-      modified: new Date(parseInt(mtimeStr) * 1000).toISOString(),
+      modified,
       encoding,
+      source: 'container',
     });
   } catch (err) {
     console.error('File read error:', err);
@@ -731,9 +871,13 @@ api.get('/files/read', async (c) => {
 
 /**
  * POST /api/files/write - Write file contents
+ * 
+ * Write-through: Writes to both container and R2 cache
  */
 api.post('/files/write', async (c) => {
   const sandbox = c.get('sandbox');
+  const userId = c.get('userId') as string | undefined;
+  const bucket = c.env.MOLTBOT_BUCKET;
   
   let body;
   try {
@@ -774,7 +918,7 @@ api.post('/files/write', async (c) => {
       }
     }
     
-    // Write file
+    // Write file to container
     if (encoding === 'base64') {
       // Write binary via base64 decode
       const proc = await sandbox.startProcess(`echo "${content}" | base64 -d > "${normalized}"`);
@@ -790,13 +934,22 @@ api.post('/files/write', async (c) => {
     const statProc = await sandbox.startProcess(`stat -c "%s|%Y" "${normalized}"`);
     await waitForProcess(statProc, 5000);
     const statLogs = await statProc.getLogs();
-    const [size, mtime] = (statLogs.stdout?.trim() || '0|0').split('|');
+    const [sizeStr, mtimeStr] = (statLogs.stdout?.trim() || '0|0').split('|');
+    const size = parseInt(sizeStr);
+    const modified = new Date(parseInt(mtimeStr) * 1000).toISOString();
+    
+    // Write-through to R2 cache (don't await - fire and forget)
+    if (userId && encoding !== 'base64') {
+      c.executionCtx.waitUntil(
+        writeFileToR2(bucket, userId, normalized, content, size, modified)
+      );
+    }
     
     return c.json({
       success: true,
       path: normalized,
-      size: parseInt(size),
-      modified: new Date(parseInt(mtime) * 1000).toISOString(),
+      size,
+      modified,
     });
   } catch (err) {
     console.error('File write error:', err);
@@ -954,9 +1107,13 @@ api.get('/files/download', async (c) => {
 
 /**
  * DELETE /api/files - Delete file (move to trash)
+ * 
+ * Also removes file from R2 cache
  */
 api.delete('/files', async (c) => {
   const sandbox = c.get('sandbox');
+  const userId = c.get('userId') as string | undefined;
+  const bucket = c.env.MOLTBOT_BUCKET;
   const path = c.req.query('path');
   const permanent = c.req.query('permanent') === 'true';
   
@@ -979,6 +1136,11 @@ api.delete('/files', async (c) => {
     
     if (checkLogs.stdout?.trim() !== 'EXISTS') {
       return c.json({ error: 'Path not found' }, 404);
+    }
+    
+    // Clear from R2 cache (don't await)
+    if (userId) {
+      c.executionCtx.waitUntil(deleteFileFromR2(bucket, userId, normalized));
     }
     
     if (permanent) {
