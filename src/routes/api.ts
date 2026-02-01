@@ -278,6 +278,84 @@ adminApi.post('/gateway/restart', async (c) => {
   }
 });
 
+// POST /api/admin/workspace/reset - Reset workspace to Clawdbot defaults
+// This deletes the user's workspace backup from R2, triggering fresh setup on next login
+adminApi.post('/workspace/reset', async (c) => {
+  const sandbox = c.get('sandbox');
+  const userId = c.req.query('userId');
+  
+  if (!userId) {
+    return c.json({ error: 'userId query parameter required' }, 400);
+  }
+
+  try {
+    // Delete the workspace folder from R2 backup
+    const userBackupPath = `${R2_MOUNT_PATH}/users/${userId}/workspace`;
+    
+    // First, make sure R2 is mounted
+    await mountR2Storage(sandbox, c.env);
+    
+    // Check if the workspace exists
+    const checkProc = await sandbox.startProcess(`ls -la "${userBackupPath}" 2>&1`);
+    await waitForProcess(checkProc, 5000);
+    const checkLogs = await checkProc.getLogs();
+    
+    if (checkLogs.stderr?.includes('No such file')) {
+      return c.json({ 
+        success: true, 
+        message: 'Workspace backup not found (already clean)',
+        userId 
+      });
+    }
+    
+    // Delete the workspace backup
+    const deleteProc = await sandbox.startProcess(`rm -rf "${userBackupPath}" && echo "deleted"`);
+    await waitForProcess(deleteProc, 10000);
+    const deleteLogs = await deleteProc.getLogs();
+    
+    const success = deleteLogs.stdout?.includes('deleted');
+    
+    if (success) {
+      return c.json({
+        success: true,
+        message: 'Workspace backup deleted. User will get fresh setup on next login.',
+        userId,
+      });
+    } else {
+      return c.json({
+        success: false,
+        error: 'Failed to delete workspace',
+        stdout: deleteLogs.stdout,
+        stderr: deleteLogs.stderr,
+      }, 500);
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/admin/workspace/list - List user workspaces in R2
+adminApi.get('/workspace/list', async (c) => {
+  const sandbox = c.get('sandbox');
+  
+  try {
+    await mountR2Storage(sandbox, c.env);
+    
+    const proc = await sandbox.startProcess(`ls -la "${R2_MOUNT_PATH}/users/" 2>&1`);
+    await waitForProcess(proc, 5000);
+    const logs = await proc.getLogs();
+    
+    return c.json({
+      stdout: logs.stdout,
+      stderr: logs.stderr,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
 // Mount admin API routes under /admin
 api.route('/admin', adminApi);
 
@@ -432,6 +510,84 @@ api.get('/history', async (c) => {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     return c.json({ error: errorMessage }, 500);
+  }
+});
+
+/**
+ * POST /api/reset-workspace - Reset workspace to Clawdbot defaults
+ * 
+ * This deletes the user's workspace backup from R2, triggering fresh setup on next login.
+ * Uses signed URL auth (same as webchat) - users can only reset their own workspace.
+ * 
+ * Optional query params:
+ * - force: If "true" and user is admin, can reset any userId specified
+ * - targetUserId: (admin only) Reset a different user's workspace
+ */
+api.post('/reset-workspace', async (c) => {
+  const userId = c.get('userId');
+  const adminSecret = c.req.query('adminSecret');
+  const targetUserId = c.req.query('targetUserId');
+  const clearSessions = c.req.query('clearSessions') !== 'false'; // Default true
+  
+  // Check for admin override: matches gateway token
+  const isAdmin = adminSecret && c.env.MOLTBOT_GATEWAY_TOKEN && adminSecret === c.env.MOLTBOT_GATEWAY_TOKEN;
+  
+  // Determine which user's workspace to reset
+  const resetUserId = (isAdmin && targetUserId) ? targetUserId : userId;
+  
+  if (!resetUserId) {
+    return c.json({ error: 'Not authenticated' }, 401);
+  }
+
+  const sandbox = c.get('sandbox');
+  const results: { workspace?: string; sessions?: string; clawdbot?: string } = {};
+
+  try {
+    // Mount R2 if not already mounted
+    await mountR2Storage(sandbox, c.env);
+    
+    // 1. Delete the workspace folder from R2 backup
+    const userBackupPath = `${R2_MOUNT_PATH}/users/${resetUserId}/workspace`;
+    const deleteWorkspaceProc = await sandbox.startProcess(`rm -rf "${userBackupPath}" 2>&1 && echo "workspace_deleted"`);
+    await waitForProcess(deleteWorkspaceProc, 10000);
+    const workspaceLogs = await deleteWorkspaceProc.getLogs();
+    results.workspace = workspaceLogs.stdout?.includes('workspace_deleted') ? 'deleted' : 'not found or failed';
+    
+    // 2. Delete clawdbot data (sessions, config, etc.) if clearSessions is true
+    if (clearSessions) {
+      const clawdbotPath = `${R2_MOUNT_PATH}/users/${resetUserId}/clawdbot`;
+      const deleteClawdbotProc = await sandbox.startProcess(`rm -rf "${clawdbotPath}" 2>&1 && echo "clawdbot_deleted"`);
+      await waitForProcess(deleteClawdbotProc, 10000);
+      const clawdbotLogs = await deleteClawdbotProc.getLogs();
+      results.clawdbot = clawdbotLogs.stdout?.includes('clawdbot_deleted') ? 'deleted' : 'not found or failed';
+      
+      // 3. Restart the gateway to clear in-memory sessions
+      const existingProcess = await findExistingMoltbotProcess(sandbox);
+      if (existingProcess) {
+        try {
+          await existingProcess.kill();
+          await new Promise(r => setTimeout(r, 1000));
+        } catch (killErr) {
+          console.error('Error killing gateway during reset:', killErr);
+        }
+      }
+      // Start fresh gateway in background
+      const bootPromise = ensureMoltbotGateway(sandbox, c.env).catch((err) => {
+        console.error('Gateway restart during reset failed:', err);
+      });
+      c.executionCtx.waitUntil(bootPromise);
+    }
+    
+    return c.json({
+      success: true,
+      message: 'User data cleared and gateway restarted. Refresh to see fresh state.',
+      userId: resetUserId,
+      isAdmin,
+      cleared: results,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage, partialResults: results }, 500);
   }
 });
 

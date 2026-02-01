@@ -27,7 +27,7 @@ RUN mkdir -p /root/.clawdbot \
     && mkdir -p /root/clawd/skills
 
 # Copy startup script
-# Build cache bust: 2026-01-29-v27-force-rebuild
+# Build cache bust: 2026-02-01-v29-clawdbot-setup
 RUN echo "rebuild-$(date +%s)" > /tmp/build-marker
 COPY start-moltbot.sh /usr/local/bin/start-moltbot.sh
 RUN chmod +x /usr/local/bin/start-moltbot.sh
@@ -37,6 +37,10 @@ COPY moltbot.json.template /root/.clawdbot-templates/moltbot.json.template
 
 # Copy custom skills
 COPY skills/ /root/clawd/skills/
+
+# Note: Workspace files (AGENTS.md, SOUL.md, etc.) are created at runtime
+# by 'clawdbot setup --non-interactive' in start-moltbot.sh
+# This uses Clawdbot's default templates for proper memory handling
 
 # Set working directory
 WORKDIR /root/clawd

@@ -298,6 +298,42 @@ console.log('Config:', JSON.stringify(config, null, 2));
 EOFNODE
 
 # ============================================================
+# BOOTSTRAP WORKSPACE WITH CLAWDBOT DEFAULTS
+# ============================================================
+# If this is a fresh workspace (no AGENTS.md), run clawdbot setup to create
+# the default workspace files. This gives us proper memory handling, personality,
+# and all the hooks for future features like heartbeats and cron.
+WORKSPACE_DIR="/root/clawd"
+if [ ! -f "$WORKSPACE_DIR/AGENTS.md" ]; then
+    echo "Fresh workspace detected, running clawdbot setup..."
+    clawdbot setup --workspace "$WORKSPACE_DIR" --non-interactive || {
+        echo "Warning: clawdbot setup failed, creating minimal workspace files"
+        mkdir -p "$WORKSPACE_DIR/memory"
+        cat > "$WORKSPACE_DIR/AGENTS.md" << 'EOFAGENTS'
+# Agent Instructions
+
+You are a personal AI assistant. Help your user with whatever they need.
+
+## Memory
+- Write important facts to USER.md
+- Use memory/YYYY-MM-DD.md for daily notes
+- If someone says "remember this", write it to a file
+EOFAGENTS
+        cat > "$WORKSPACE_DIR/USER.md" << 'EOFUSER'
+# About Your User
+
+*Update this file when you learn things about your user.*
+
+- **Name:** (not yet known)
+- **Timezone:** (not yet known)
+EOFUSER
+    }
+    echo "Workspace initialized"
+else
+    echo "Workspace already initialized (AGENTS.md exists)"
+fi
+
+# ============================================================
 # START BACKGROUND SYNC
 # ============================================================
 # Sync workspace and config to R2 every 30 seconds
