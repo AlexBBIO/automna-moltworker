@@ -965,6 +965,21 @@ app.all('*', async (c) => {
     serverWs.addEventListener('close', (event) => {
       console.log('[WS] Client closed:', event.code, event.reason);
       containerWs.close(event.code, event.reason);
+      
+      // Sync to R2 when user disconnects (ensures latest messages are persisted)
+      if (userId) {
+        c.executionCtx.waitUntil(
+          syncToR2(sandbox, c.env, { userId }).then(syncResult => {
+            if (syncResult.success) {
+              console.log(`[WS] Disconnect sync completed for user ${userId}`);
+            } else {
+              console.warn(`[WS] Disconnect sync failed: ${syncResult.error}`);
+            }
+          }).catch(err => {
+            console.warn(`[WS] Disconnect sync error:`, err);
+          })
+        );
+      }
     });
     
     containerWs.addEventListener('close', (event) => {
