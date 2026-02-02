@@ -1,144 +1,94 @@
 #!/bin/bash
 # Startup script for Moltbot in Cloudflare Sandbox
+# OPTIMIZED FOR FAST STARTUP
+#
+# Strategy: Start gateway ASAP, restore R2 in background
 # This script:
-# 1. Restores config from R2 backup if available
-# 2. Configures moltbot from environment variables
-# 3. Starts a background sync to backup config to R2
-# 4. Starts the gateway
+# 1. Quick setup: create minimal config from template
+# 2. Update config from env vars
+# 3. Start gateway (accepts connections immediately)
+# 4. Background: restore workspace from R2, start sync
 
 set -e
 
+STARTUP_START=$(date +%s%3N)
+log_time() {
+    local now=$(date +%s%3N)
+    local elapsed=$((now - STARTUP_START))
+    echo "[${elapsed}ms] $1"
+}
+
 # Check if clawdbot gateway is already running - bail early if so
-# Note: CLI is still named "clawdbot" until upstream renames it
 if pgrep -f "clawdbot gateway" > /dev/null 2>&1; then
-    echo "Moltbot gateway is already running, exiting."
+    log_time "Gateway already running, exiting."
     exit 0
 fi
 
-# Paths (clawdbot paths are used internally - upstream hasn't renamed yet)
+# Paths
 CONFIG_DIR="/root/.clawdbot"
 CONFIG_FILE="$CONFIG_DIR/clawdbot.json"
 TEMPLATE_DIR="/root/.clawdbot-templates"
 TEMPLATE_FILE="$TEMPLATE_DIR/moltbot.json.template"
+WORKSPACE_DIR="/root/clawd"
 
-# Per-user R2 path for data isolation
+# Per-user R2 path
 if [ -n "$MOLTBOT_USER_ID" ]; then
     BACKUP_DIR="/data/moltbot/users/$MOLTBOT_USER_ID"
-    echo "Using per-user backup path: $BACKUP_DIR"
 else
     BACKUP_DIR="/data/moltbot"
-    echo "Using shared backup path (no user ID)"
 fi
-echo "User ID: ${MOLTBOT_USER_ID:-none}"
-echo "Config directory: $CONFIG_DIR"
-echo "Backup directory: $BACKUP_DIR"
 
-# Create config directory
-mkdir -p "$CONFIG_DIR"
+log_time "User: ${MOLTBOT_USER_ID:-shared}, Backup: $BACKUP_DIR"
+
+# Create directories
+mkdir -p "$CONFIG_DIR" "$WORKSPACE_DIR"
 
 # ============================================================
-# RESTORE FROM R2 BACKUP
+# FAST PATH: If config exists, skip to config update
+# (Warm container - local files are still there)
 # ============================================================
-# Check if R2 backup exists by looking for clawdbot.json
-# The BACKUP_DIR may exist but be empty if R2 was just mounted
-# Note: backup structure is $BACKUP_DIR/clawdbot/ and $BACKUP_DIR/skills/
-
-# Helper function to check if R2 backup is newer than local
-should_restore_from_r2() {
-    local R2_SYNC_FILE="$BACKUP_DIR/.last-sync"
-    local LOCAL_SYNC_FILE="$CONFIG_DIR/.last-sync"
-    
-    # If no R2 sync timestamp, don't restore
-    if [ ! -f "$R2_SYNC_FILE" ]; then
-        echo "No R2 sync timestamp found, skipping restore"
-        return 1
-    fi
-    
-    # If no local sync timestamp, restore from R2
-    if [ ! -f "$LOCAL_SYNC_FILE" ]; then
-        echo "No local sync timestamp, will restore from R2"
-        return 0
-    fi
-    
-    # Compare timestamps
-    R2_TIME=$(cat "$R2_SYNC_FILE" 2>/dev/null)
-    LOCAL_TIME=$(cat "$LOCAL_SYNC_FILE" 2>/dev/null)
-    
-    echo "R2 last sync: $R2_TIME"
-    echo "Local last sync: $LOCAL_TIME"
-    
-    # Convert to epoch seconds for comparison
-    R2_EPOCH=$(date -d "$R2_TIME" +%s 2>/dev/null || echo "0")
-    LOCAL_EPOCH=$(date -d "$LOCAL_TIME" +%s 2>/dev/null || echo "0")
-    
-    if [ "$R2_EPOCH" -gt "$LOCAL_EPOCH" ]; then
-        echo "R2 backup is newer, will restore"
-        return 0
-    else
-        echo "Local data is newer or same, skipping restore"
-        return 1
-    fi
-}
-
-# Try new structure first (config/ and workspace/)
-if [ -f "$BACKUP_DIR/config/clawdbot.json" ]; then
-    if should_restore_from_r2; then
-        echo "Restoring config from R2 at $BACKUP_DIR/config/..."
-        cp -a "$BACKUP_DIR/config/." "$CONFIG_DIR/"
-        echo "Restored config from R2"
-    fi
-    if [ -d "$BACKUP_DIR/workspace" ] && [ "$(ls -A $BACKUP_DIR/workspace 2>/dev/null)" ]; then
-        if should_restore_from_r2; then
-            echo "Restoring workspace from R2 at $BACKUP_DIR/workspace/..."
-            mkdir -p /root/clawd
-            cp -a "$BACKUP_DIR/workspace/." /root/clawd/
-            echo "Restored workspace from R2"
-        fi
-    fi
-# Legacy: clawdbot/ subdirectory
-elif [ -f "$BACKUP_DIR/clawdbot/clawdbot.json" ]; then
-    if should_restore_from_r2; then
-        echo "Restoring from legacy R2 backup at $BACKUP_DIR/clawdbot..."
-        cp -a "$BACKUP_DIR/clawdbot/." "$CONFIG_DIR/"
-        cp -f "$BACKUP_DIR/.last-sync" "$CONFIG_DIR/.last-sync" 2>/dev/null || true
-        echo "Restored config from R2 backup"
-    fi
-# Legacy: flat structure
-elif [ -f "$BACKUP_DIR/clawdbot.json" ]; then
-    if should_restore_from_r2; then
-        echo "Restoring from legacy flat R2 backup at $BACKUP_DIR..."
-        cp -a "$BACKUP_DIR/." "$CONFIG_DIR/"
-        cp -f "$BACKUP_DIR/.last-sync" "$CONFIG_DIR/.last-sync" 2>/dev/null || true
-        echo "Restored config from legacy R2 backup"
-    fi
-elif [ -d "$BACKUP_DIR" ]; then
-    echo "R2 mounted at $BACKUP_DIR but no backup data found yet"
+if [ -f "$CONFIG_FILE" ] && [ -f "$WORKSPACE_DIR/AGENTS.md" ]; then
+    log_time "Warm container detected, skipping R2 restore"
 else
-    echo "R2 not mounted, starting fresh"
-fi
-
-# Restore skills from R2 backup if available (only if R2 is newer)
-# Check both new location (inside workspace) and legacy location
-SKILLS_DIR="/root/clawd/skills"
-if [ -d "$BACKUP_DIR/workspace/skills" ] && [ "$(ls -A $BACKUP_DIR/workspace/skills 2>/dev/null)" ]; then
-    # Skills already restored with workspace
-    echo "Skills restored with workspace"
-elif [ -d "$BACKUP_DIR/skills" ] && [ "$(ls -A $BACKUP_DIR/skills 2>/dev/null)" ]; then
-    if should_restore_from_r2; then
-        echo "Restoring skills from legacy $BACKUP_DIR/skills..."
-        mkdir -p "$SKILLS_DIR"
-        cp -a "$BACKUP_DIR/skills/." "$SKILLS_DIR/"
-        echo "Restored skills from R2 backup"
+    # ============================================================
+    # COLD PATH: Quick R2 restore (no timestamp comparison)
+    # ============================================================
+    log_time "Cold start, restoring from R2..."
+    
+    # Try new structure first (config/ and workspace/)
+    if [ -f "$BACKUP_DIR/config/clawdbot.json" ]; then
+        log_time "Restoring config from R2..."
+        cp -a "$BACKUP_DIR/config/." "$CONFIG_DIR/" 2>/dev/null || true
+        if [ -d "$BACKUP_DIR/workspace" ]; then
+            log_time "Restoring workspace from R2..."
+            cp -a "$BACKUP_DIR/workspace/." "$WORKSPACE_DIR/" 2>/dev/null || true
+        fi
+    # Legacy: clawdbot/ subdirectory
+    elif [ -f "$BACKUP_DIR/clawdbot/clawdbot.json" ]; then
+        log_time "Restoring from legacy R2 backup..."
+        cp -a "$BACKUP_DIR/clawdbot/." "$CONFIG_DIR/" 2>/dev/null || true
+    # Legacy: flat structure  
+    elif [ -f "$BACKUP_DIR/clawdbot.json" ]; then
+        log_time "Restoring from legacy flat R2 backup..."
+        cp -a "$BACKUP_DIR/." "$CONFIG_DIR/" 2>/dev/null || true
+    else
+        log_time "No R2 backup found, starting fresh"
+    fi
+    
+    # Restore skills from legacy location if needed
+    if [ ! -d "$WORKSPACE_DIR/skills" ] && [ -d "$BACKUP_DIR/skills" ]; then
+        cp -a "$BACKUP_DIR/skills" "$WORKSPACE_DIR/" 2>/dev/null || true
     fi
 fi
 
-# If config file still doesn't exist, create from template
+# ============================================================
+# CREATE CONFIG FROM TEMPLATE IF NEEDED
+# ============================================================
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "No existing config found, initializing from template..."
+    log_time "Creating config from template..."
     if [ -f "$TEMPLATE_FILE" ]; then
         cp "$TEMPLATE_FILE" "$CONFIG_FILE"
     else
-        # Create minimal config if template doesn't exist
         cat > "$CONFIG_FILE" << 'EOFCONFIG'
 {
   "agents": {
@@ -153,8 +103,6 @@ if [ ! -f "$CONFIG_FILE" ]; then
 }
 EOFCONFIG
     fi
-else
-    echo "Using existing config"
 fi
 
 # ============================================================
@@ -298,18 +246,13 @@ console.log('Config:', JSON.stringify(config, null, 2));
 EOFNODE
 
 # ============================================================
-# BOOTSTRAP WORKSPACE WITH CLAWDBOT DEFAULTS
+# BOOTSTRAP WORKSPACE (FAST - minimal files only)
+# Full clawdbot setup runs in background after gateway starts
 # ============================================================
-# If this is a fresh workspace (no AGENTS.md), run clawdbot setup to create
-# the default workspace files. This gives us proper memory handling, personality,
-# and all the hooks for future features like heartbeats and cron.
-WORKSPACE_DIR="/root/clawd"
 if [ ! -f "$WORKSPACE_DIR/AGENTS.md" ]; then
-    echo "Fresh workspace detected, running clawdbot setup..."
-    clawdbot setup --workspace "$WORKSPACE_DIR" --non-interactive || {
-        echo "Warning: clawdbot setup failed, creating minimal workspace files"
-        mkdir -p "$WORKSPACE_DIR/memory"
-        cat > "$WORKSPACE_DIR/AGENTS.md" << 'EOFAGENTS'
+    log_time "Creating minimal workspace files..."
+    mkdir -p "$WORKSPACE_DIR/memory"
+    cat > "$WORKSPACE_DIR/AGENTS.md" << 'EOFAGENTS'
 # Agent Instructions
 
 You are a personal AI assistant. Help your user with whatever they need.
@@ -319,7 +262,7 @@ You are a personal AI assistant. Help your user with whatever they need.
 - Use memory/YYYY-MM-DD.md for daily notes
 - If someone says "remember this", write it to a file
 EOFAGENTS
-        cat > "$WORKSPACE_DIR/USER.md" << 'EOFUSER'
+    cat > "$WORKSPACE_DIR/USER.md" << 'EOFUSER'
 # About Your User
 
 *Update this file when you learn things about your user.*
@@ -327,62 +270,58 @@ EOFAGENTS
 - **Name:** (not yet known)
 - **Timezone:** (not yet known)
 EOFUSER
-    }
-    echo "Workspace initialized"
+    NEEDS_FULL_SETUP=true
 else
-    echo "Workspace already initialized (AGENTS.md exists)"
+    log_time "Workspace exists"
+    NEEDS_FULL_SETUP=false
 fi
 
 # ============================================================
-# START BACKGROUND SYNC
+# START BACKGROUND TASKS
 # ============================================================
-# Sync workspace and config to R2 every 30 seconds
-# This ensures data persists across container restarts
-if [ -d "$BACKUP_DIR" ]; then
-    echo "Starting background sync to R2 (every 30 seconds)..."
-    (
+# These run AFTER gateway starts (non-blocking)
+
+start_background_tasks() {
+    # Run full clawdbot setup if needed (adds SOUL.md, better AGENTS.md, etc.)
+    if [ "$NEEDS_FULL_SETUP" = "true" ]; then
+        log_time "[bg] Running full clawdbot setup..."
+        clawdbot setup --workspace "$WORKSPACE_DIR" --non-interactive 2>/dev/null || true
+        log_time "[bg] Full setup complete"
+    fi
+    
+    # Start periodic R2 sync
+    if [ -d "$BACKUP_DIR" ]; then
+        log_time "[bg] Starting R2 sync loop..."
         while true; do
-            # Sync workspace
-            if [ -d "/root/clawd" ]; then
-                rsync -a --delete /root/clawd/ "$BACKUP_DIR/workspace/" 2>/dev/null || true
-            fi
-            # Sync config
-            if [ -d "$CONFIG_DIR" ]; then
-                rsync -a --delete "$CONFIG_DIR/" "$BACKUP_DIR/config/" 2>/dev/null || true
-            fi
-            # Update sync timestamp
+            rsync -a --delete "$WORKSPACE_DIR/" "$BACKUP_DIR/workspace/" 2>/dev/null || true
+            rsync -a --delete "$CONFIG_DIR/" "$BACKUP_DIR/config/" 2>/dev/null || true
             date -Iseconds > "$BACKUP_DIR/.last-sync" 2>/dev/null || true
             sleep 30
         done
-    ) &
-    echo "Background sync started (PID: $!)"
-else
-    echo "R2 not mounted, skipping background sync"
-fi
+    fi
+}
+
+# Launch background tasks (runs after gateway starts)
+start_background_tasks &
+BACKGROUND_PID=$!
+log_time "Background tasks started (PID: $BACKGROUND_PID)"
 
 # ============================================================
 # START GATEWAY
 # ============================================================
-echo "Starting Moltbot Gateway..."
-echo "Gateway will be available on port 18789"
+log_time "Starting gateway..."
 
 # Clean up stale lock files
 rm -f /tmp/clawdbot-gateway.lock 2>/dev/null || true
 rm -f "$CONFIG_DIR/gateway.lock" 2>/dev/null || true
 
 BIND_MODE="lan"
-echo "Dev mode: ${CLAWDBOT_DEV_MODE:-false}, Bind mode: $BIND_MODE"
-echo "Token present: $([ -n "$CLAWDBOT_GATEWAY_TOKEN" ] && echo "YES (${#CLAWDBOT_GATEWAY_TOKEN} chars)" || echo "NO")"
 
 if [ -n "$CLAWDBOT_GATEWAY_TOKEN" ]; then
-    echo "Starting gateway with token auth (token length: ${#CLAWDBOT_GATEWAY_TOKEN})..."
+    log_time "Gateway starting with token auth"
     exec clawdbot gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE" --token "$CLAWDBOT_GATEWAY_TOKEN"
 else
-    echo "Starting gateway with device pairing (no token)..."
+    log_time "Gateway starting with device pairing"
     exec clawdbot gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE"
 fi
-# Rebuild marker: 1769727830
-# Rebuild: 1769729813
-# Rebuild: 1769730234
-# Rebuild: 1769731314
-# Rebuild: 1769904300
+# Fast startup optimization: 2026-02-02
