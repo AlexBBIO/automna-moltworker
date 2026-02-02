@@ -1,5 +1,11 @@
 # Moltbot on Cloudflare Workers
 
+> **⚠️ DEPRECATED (2026-02-02):** This Moltworker architecture has been replaced by **Fly.io** infrastructure.
+> See `/docs/PER-USER-SETUP.md` and `/docs/AGENT-CONFIG-SYSTEM.md` for current architecture.
+> This directory is kept for historical reference only.
+
+---
+
 Run [Moltbot](https://molt.bot/) personal AI assistant in a [Cloudflare Sandbox](https://developers.cloudflare.com/sandbox/).
 
 > **Experimental:** This is a proof of concept demonstrating that Moltbot can run in Cloudflare Sandbox. It is not officially supported and may break without notice. Use at your own risk.
